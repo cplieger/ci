@@ -15,6 +15,9 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
+import workflow_commands as wc
+
 COMMENT_CEILING = 0.5
 MARGIN = 1.1
 LIMIT = COMMENT_CEILING * MARGIN
@@ -428,17 +431,17 @@ def emit(result: Audit, github: bool) -> int:
     )
     excluded = ', '.join(f'{name}={count}' for name, count in sorted(result.excluded.items()))
     if excluded:
-        print(f'Excluded files: {excluded}')
+        wc.say(t'Excluded files: {excluded}')
     if not result.files or result.code == 0:
         message = 'no executable code lines found; add the repository to the non-app denylist if intentional'
         print(f'Comment ratio: FAIL — {message}')
         if github:
-            print(f'::error title=Comment ratio::{message}')
+            print(wc.command('error', message, title='Comment ratio'))
         return 1
     if ratio <= LIMIT:
         print(f'Comment ratio: PASS — {summary}')
         if github:
-            print(f'::notice title=Comment ratio::{summary}')
+            print(wc.command('notice', summary, title='Comment ratio'))
         return 0
     message = f'Comment ratio: FAIL — {summary}'
     print(message)
@@ -447,12 +450,12 @@ def emit(result: Audit, github: bool) -> int:
         if item.comments:
             file_ratio = item.comments / item.code if item.code else float('inf')
             display_path = json.dumps(item.path, ensure_ascii=True)
-            print(
-                f'  {display_path}: {item.comments} comments / {item.code} code = '
-                f'{file_ratio:.2f}:1'
+            wc.say(
+                t'  {display_path}: {item.comments} comments / {item.code} code = '
+                t'{file_ratio:.2f}:1'
             )
     if github:
-        print(f'::error title=Excessive comments::{summary}')
+        print(wc.command('error', summary, title='Excessive comments'))
     return 1
 
 
@@ -465,14 +468,14 @@ def main(argv: list[str]) -> int:
     repository = repository_name(root)
     if repository in EXCLUDED_REPOSITORIES:
         message = f'{repository} is excluded because it is not an app repository'
-        print(f'Comment ratio: SKIP — {message}')
+        wc.say(t'Comment ratio: SKIP — {message}')
         if args.github:
-            print(f'::notice title=Comment ratio::{message}')
+            print(wc.command('notice', message, title='Comment ratio'))
         return 0
     try:
         result = audit(root)
     except RuntimeError as exc:
-        print(f'comment audit: {exc}', file=sys.stderr)
+        wc.say(t'comment audit: {exc}', file=sys.stderr)
         return 2
     return emit(result, args.github)
 

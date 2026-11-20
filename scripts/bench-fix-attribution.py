@@ -35,6 +35,8 @@ import json
 import pathlib
 import sys
 
+import workflow_commands
+
 PREFIX = 'window.BENCHMARK_DATA = '
 
 
@@ -139,13 +141,13 @@ def main() -> int:
         replacement = commit_from_api(json.loads(args.commit_json.read_text()))
         touched = repair(data, args.expect_commit, replacement, args.repo_url)
     except (FormatError, json.JSONDecodeError, OSError) as err:
-        print(f'bench-fix-attribution: {err}', file=sys.stderr)
+        workflow_commands.say(t'bench-fix-attribution: {err}', file=sys.stderr)
         return 1
 
     dump(args.data_file, data)
-    print(
-        f're-pointed {len(touched)} suite(s) {touched} from {args.expect_commit[:12]} '
-        f'to {replacement["id"][:12]}; repoUrl={args.repo_url}'
+    workflow_commands.say(
+        t're-pointed {len(touched)} suite(s) {touched} from {args.expect_commit[:12]} '
+        t'to {replacement["id"][:12]}; repoUrl={args.repo_url}'
     )
     return 0
 

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import mutation_cost
+import workflow_commands
 from mutation_cost import Bin, Item
 
 if TYPE_CHECKING:
@@ -669,10 +670,11 @@ def matrix(
             for f in e.get('files', {}).values()
             if f.get('cost') == 'measured'
         )
-        mutation_cost.say(
+        workflow_commands.say(
             t'{repo}: {k} shard(s), projected {plan["projected_minutes"]} min '
             t'(one job: {plan["one_job_minutes"]} min, {measured} file(s) priced from '
-            t'{"history" if history else "no history"})'
+            t'{"history" if history else "no history"})',
+            file=sys.stderr,
         )
     if k == 1:
         return [{'repo': repo, 'attempt': n} for n in range(1, attempts + 1)]
@@ -945,7 +947,9 @@ def main() -> int:
         )
         args.out.write_text(json.dumps(doc, indent=1) + '\n')
         files = sum(len(e['files']) for e in doc['modules'].values())
-        mutation_cost.say(t'{args.repo}: sized {len(doc["modules"])} module(s), {files} file(s)')
+        workflow_commands.say(
+            t'{args.repo}: sized {len(doc["modules"])} module(s), {files} file(s)', file=sys.stderr
+        )
         if unsized:
             return 1
     elif args.command == 'matrix':
@@ -968,13 +972,13 @@ def main() -> int:
     else:
         doc = history(args.repo, args.artifacts_dir, args.previous, args.plan)
         if doc is None:
-            mutation_cost.say(t'{args.repo}: no cost record this week')
+            workflow_commands.say(t'{args.repo}: no cost record this week', file=sys.stderr)
             return 0
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(doc, indent=1) + '\n')
         if (measured := doc['slowdown']) is not None:
             line = t'{args.repo}: runner slowdown this week {measured}x on identical work'
-            mutation_cost.say(line)
+            workflow_commands.say(line, file=sys.stderr)
             mutation_cost.summarize(line)
             if measured > mutation_cost.SLOWDOWN:
                 mutation_cost.annotate(
@@ -988,4 +992,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(mutation_cost.run_main(main))
+    sys.exit(workflow_commands.run_main(main))

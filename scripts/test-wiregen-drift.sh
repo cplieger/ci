@@ -30,7 +30,7 @@ $out" ;;
 }
 expect_runs() { # expect_runs <label> <expected "wiregen: go -C" lines, sorted>
   local got
-  got=$(printf '%s\n' "$out" | grep '^wiregen: go -C ' | sort)
+  got=$(printf '%s\n' "$out" | sed -n 's/^- \(wiregen: go -C \)/\1/p' | sort)
   if [ "$got" = "$2" ]; then pass "$1"; else fail "$1" "ran:
 $got
 want:
@@ -132,7 +132,7 @@ commit() { # commit <tree>
 }
 run_step() { # run_step <tree>; sets $out $rc
   rm -f "$WORK/failures"
-  out=$(cd "$1" && bash --noprofile --norc -e "$WORK/step.sh" 2>&1)
+  out=$(cd "$1" && CI_TOOLS="$ROOT/scripts" bash --noprofile --norc -e "$WORK/step.sh" 2>&1)
   rc=$?
 }
 root_app() { # root_app <tree>: a root module whose cmd/gen writes api.gen.go

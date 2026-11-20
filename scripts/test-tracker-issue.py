@@ -538,7 +538,7 @@ class TrackerIssueTest(unittest.TestCase):
             *self.tracker_args('--mode', 'upsert', '--body-file', str(self.body)),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn('attempting the issue ops anyway', proc.stderr)
+        self.assertIn('so the issue ops run anyway', proc.stderr)
         self.assertEqual(self.writes(), ['PATCH issue'])
 
     def test_missing_label_is_created_and_an_existing_one_is_silent(self) -> None:
@@ -943,6 +943,7 @@ class GatePolicyTest(unittest.TestCase):
         tracker_dir = self.workspace / 'ci' / 'scripts'
         tracker_dir.mkdir(parents=True)
         (tracker_dir / 'tracker_issue.py').write_text(GATE_STUB_TRACKER)
+        (tracker_dir / 'gha-log.sh').symlink_to(Path(__file__).resolve().parent / 'gha-log.sh')
         self.runner_temp = self.tmp / 'runner-temp'
         self.runner_temp.mkdir()
         self.scenario = self.tmp / 'gate-scenario.json'

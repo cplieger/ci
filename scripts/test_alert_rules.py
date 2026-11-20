@@ -116,7 +116,9 @@ class Wiring(unittest.TestCase):
     def test_validate_fails_on_a_failed_alerts_job(self):
         validate = self.jobs['validate']
         self.assertIn('alerts', validate['needs'])
-        step = validate['steps'][0]
+        step = next(
+            s for s in validate['steps'] if s.get('name') == 'Aggregate CI dispatch results'
+        )
         self.assertEqual(step['env']['ALERTS'], '${{ needs.alerts.result }}')
         self.assertIn('"alerts=$ALERTS"', step['run'])
 

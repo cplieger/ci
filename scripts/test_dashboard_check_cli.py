@@ -19,6 +19,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from dashboard_check_fixtures import (
     ACTION,
     CLASSIC,
+    ROOT,
     V2_STUB,
     run_cli,
     valid,
@@ -462,8 +463,10 @@ class Install(unittest.TestCase):
 
     def copy_action(self) -> pathlib.Path:
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
-        action = tmp / 'dashboard-check'
+        action = tmp / 'actions' / 'dashboard-check'
         shutil.copytree(ACTION, action, ignore=shutil.ignore_patterns('__pycache__'))
+        (tmp / 'scripts').mkdir()
+        shutil.copy(ROOT / 'scripts' / 'gha-log.sh', tmp / 'scripts')
         return action
 
     def key(self, action: pathlib.Path) -> str:

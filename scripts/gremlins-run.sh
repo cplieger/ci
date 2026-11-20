@@ -9,6 +9,9 @@
 # PLAN_DIR and PLAN_DEADLINE (size the module).
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
+
 # The clone is bind-mounted from the runner and owned by the runner uid, while
 # this container runs as root, so git refuses it as "dubious ownership" (exit
 # 128) and every `go build` a test runs fails under -buildvcs=auto. Trust every
@@ -62,7 +65,7 @@ select_mode() {
       return 0
       ;;
     *)
-      printf '::error::GREMLINS_MODE=%s is neither integration nor per-package\n' "${GREMLINS_MODE}" >&2
+      gha_annotate error 'GREMLINS_MODE=%s is neither integration nor per-package' "${GREMLINS_MODE}" >&2
       return 1
       ;;
   esac
@@ -89,7 +92,7 @@ time_package_mutants() {
     | while IFS=$'\t' read -r dir path file; do
       [ -n "${file}" ] || continue
       if [ "$(date +%s)" -ge "$1" ]; then
-        [ -n "${late}" ] || echo "::warning::the plan deadline passed before ${path}, so it and every later package take the dearest package's time" >&2
+        [ -n "${late}" ] || gha_annotate warning "the plan deadline passed before %s, so it and every later package take the dearest package's time" "${path}" >&2
         late=1
         continue
       fi
@@ -114,7 +117,7 @@ retry() {
       return 0
     fi
     [ "${attempt}" -eq 8 ] && break
-    echo "::warning::attempt ${attempt} of '$*' failed; retrying in ${delay}s" >&2
+    gha_annotate warning "attempt %s of '%s' failed, so it is retried in %ss" "${attempt}" "$*" "${delay}" >&2
     sleep "${delay}"
     delay=$((delay * 2))
   done
@@ -142,7 +145,7 @@ retry clone_gremlins
 read -r -a patches <<<"${GREMLINS_PATCHES}"
 for patch in "${patches[@]}"; do
   if ! git -C "${gremlins_src}" apply --check "${patch}"; then
-    echo "::error::scripts/${patch##*/} no longer applies to gremlins ${GREMLINS_VERSION}. If that release fixes the upstream issue listed for this patch in scripts/gremlins-run.sh, delete the patch (and this build step if it was the last one). Otherwise rebase the patch onto the release."
+    gha_annotate error 'scripts/%s no longer applies to gremlins %s. If that release fixes the upstream issue listed for this patch in scripts/gremlins-run.sh, delete the patch (and this build step if it was the last one). Otherwise rebase the patch onto the release.' "${patch##*/}" "${GREMLINS_VERSION}"
     exit 1
   fi
   git -C "${gremlins_src}" apply "${patch}"
@@ -207,7 +210,7 @@ choose_workers() {
     # The plan sized this shard at the count its own probe left; a probe
     # here that failed would run the shard at 1 worker, ~4x its projection.
     workers="${GREMLINS_WORKERS}"
-    echo "workers=${workers} (set by the shard plan, so no concurrency probe)"
+    gha_say 'workers=%s (set by the shard plan, so no concurrency probe)' "${workers}"
     return 0
   fi
   [ "${WORKERS_MAX}" -gt 1 ] || return 0
@@ -262,20 +265,20 @@ choose_workers() {
     if [ "${ra}" = 124 ] || [ "${rb}" = 124 ]; then
       # Unverified beats throttled: a suite too slow to probe is also a suite
       # whose mutation run needs every worker it can get.
-      echo "::warning::concurrency probe timed out (>${PROBE_TIMEOUT}s); keeping ${WORKERS_MAX} workers unverified"
+      gha_annotate warning 'concurrency probe timed out (>%ss), so %s workers are kept unverified' "${PROBE_TIMEOUT}" "${WORKERS_MAX}"
     elif [ "${ra}" -ne 0 ] || [ "${rb}" -ne 0 ]; then
       workers=1
       export GOMEMLIMIT="${GOMEM_SOLO_MB}MiB"
-      echo "::warning::suite passes in one tree copy but fails when two copies run at once (exit ${ra}/${rb})"
+      gha_annotate warning 'suite passes in one tree copy but fails when two copies run at once (exit %s/%s)' "${ra}" "${rb}"
       echo "::warning::forcing --workers 1: cross-worker interference reports false KILLs, not lost mutants"
-      grep -hE "FAIL|panic:" /tmp/probe-a.log /tmp/probe-b.log | head -20 || true
+      grep -hE "FAIL|panic:" /tmp/probe-a.log /tmp/probe-b.log | head -20 | while IFS= read -r l; do gha_say '%s' "$l"; done || true
     else
       echo "concurrency probe passed; keeping ${WORKERS_MAX} workers"
     fi
   else
     # Not the probe's business to diagnose a red suite — gremlins fails its own
     # coverage pass next and reports it as the error it is.
-    echo "::warning::suite does not pass on its own; skipping the concurrency probe, keeping ${WORKERS_MAX} workers"
+    gha_annotate warning 'suite does not pass on its own; skipping the concurrency probe, keeping %s workers' "${WORKERS_MAX}"
   fi
 
   # --integration alone changes only which tests a mutant runs; --coverpkg ./...

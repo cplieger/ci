@@ -221,6 +221,7 @@ class Harness(unittest.TestCase):
             'GIT_CONFIG_GLOBAL': '/dev/null',
             'STUB_LOG': str(self.log),
             'GO_OS_FILES': str(self.bin / 'go-os-files'),
+            'CI_TOOLS': str(ROOT / 'scripts'),
             **(env or {}),
         }
         proc = subprocess.run(
@@ -456,7 +457,9 @@ class Validate(Harness):
     def test_validate_waits_for_both_jobs_and_maps_their_results(self):
         job = load(META)['jobs']['validate']
         self.assertLessEqual({'deadset', 'deadset-canary'}, set(job['needs']))
-        env = job['steps'][0]['env']
+        env = next(s for s in job['steps'] if s.get('name') == 'Aggregate CI dispatch results')[
+            'env'
+        ]
         self.assertEqual(env['DEADSET'], '${{ needs.deadset.result }}')
         self.assertEqual(env['DEADSET_CANARY'], '${{ needs.deadset-canary.result }}')
         self.assertEqual(env['CI_REPO'], "${{ github.repository == 'cplieger/ci' }}")
@@ -1052,6 +1055,7 @@ class InstallSteps(Harness):
         self.assertEqual(
             env,
             {
+                'CI_TOOLS': '${{ runner.temp }}/cplieger-ci/scripts',
                 'GO': '${{ steps.census.outputs.go }}',
                 'TS': '${{ steps.census.outputs.ts }}',
                 'GO_DIRS': '${{ steps.census.outputs.go_dirs }}',

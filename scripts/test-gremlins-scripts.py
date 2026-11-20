@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import mutation_cost  # noqa: E402
+import workflow_commands  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location('gremlins_aggregate', HERE / 'gremlins-aggregate.py')
 gremlins_aggregate = importlib.util.module_from_spec(_spec)
@@ -31,6 +33,8 @@ _spec.loader.exec_module(gremlins_aggregate)
 MERGE = HERE / 'gremlins-merge.py'
 AGGREGATE = HERE / 'gremlins-aggregate.py'
 RUNNER = HERE / 'gremlins-run.sh'
+# gremlins-run.sh's own `. gha-log.sh`, run before any function extracted from it.
+GHA_LOG = f'. {shlex.quote(str(HERE / "gha-log.sh"))}\n'
 SCOPE = HERE / 'gremlins-scope.py'
 SHARD = HERE / 'gremlins-shard.py'
 CONTAINER = HERE / 'gremlins-container.sh'
@@ -1798,7 +1802,7 @@ def call_shell(
             '--norc',
             '--noprofile',
             '-c',
-            f'set -euo pipefail\n{body}\n{name} "$@"',
+            f'set -euo pipefail\n{GHA_LOG}{body}\n{name} "$@"',
             name,
             *args,
         ],
@@ -2867,7 +2871,7 @@ def test_runner_stamps_each_output_line(tmp: Path) -> None:
             '--norc',
             '--noprofile',
             '-c',
-            f'set -euo pipefail\n{src}\nprintf "a b\\n  KILLED x\\nlast" | stamp_lines "$1"',
+            f'set -euo pipefail\n{GHA_LOG}{src}\nprintf "a b\\n  KILLED x\\nlast" | stamp_lines "$1"',
             'bash',
             str(rec),
         ],
@@ -2895,7 +2899,7 @@ def test_runner_stamps_each_output_line(tmp: Path) -> None:
             '--norc',
             '--noprofile',
             '-c',
-            f'set -euo pipefail\n{src}\n{{ echo x; exit 7; }} | stamp_lines "$1"',
+            f'set -euo pipefail\n{GHA_LOG}{src}\n{{ echo x; exit 7; }} | stamp_lines "$1"',
             'bash',
             str(rec),
         ],
@@ -3031,7 +3035,7 @@ def test_runner_stops_at_the_run_deadline_with_its_costs_on_record(tmp: Path) ->
                 '--norc',
                 '--noprofile',
                 '-c',
-                f'set -euo pipefail\n{srcs[0]}\n{srcs[1]}\nworkers=2 coefficient=3\nmode_flags=()\nunleash_mutants',
+                f'set -euo pipefail\n{GHA_LOG}{srcs[0]}\n{srcs[1]}\nworkers=2 coefficient=3\nmode_flags=()\nunleash_mutants',
             ],
             capture_output=True,
             text=True,
@@ -4294,6 +4298,8 @@ def test_runner_takes_the_mode_the_plan_set(tmp: Path) -> None:
 def stub_tools(d: Path, tools: dict[str, str]) -> str:
     """Write each `name: sh body` as an executable in d; returns a PATH with d first."""
     d.mkdir(parents=True, exist_ok=True)
+    if d.name == 'scripts' and not (d / 'gha-log.sh').exists():
+        (d / 'gha-log.sh').symlink_to(HERE / 'gha-log.sh')
     for name, body in tools.items():
         (d / name).write_text(f'#!/bin/sh\n{body}\n')
         (d / name).chmod(0o755)
@@ -4336,7 +4342,7 @@ def test_runner_shard_takes_the_plans_workers(tmp: Path) -> None:
                 '--noprofile',
                 '-c',
                 (
-                    f'set -euo pipefail\n{src}\nchoose_workers\n'
+                    f'set -euo pipefail\n{GHA_LOG}{src}\nchoose_workers\n'
                     'printf "workers=%s GOMEMLIMIT=%s\\n" "${workers}" "${GOMEMLIMIT}"'
                 ),
             ],
@@ -4405,7 +4411,7 @@ def test_runner_plan_probe_ends_by_the_deadline(tmp: Path) -> None:
                 '--noprofile',
                 '-c',
                 (
-                    f'set -euo pipefail\n{"".join(srcs)}\n'
+                    f'set -euo pipefail\n{GHA_LOG}{"".join(srcs)}\n'
                     'plan_time_left\nprintf "probe=%s\\n" "${PROBE_TIMEOUT}"\nchoose_workers'
                 ),
             ],
@@ -4528,7 +4534,7 @@ def time_mutants(
             '--norc',
             '--noprofile',
             '-c',
-            f'set -euo pipefail\n{src}\ntime_package_mutants {deadline}',
+            f'set -euo pipefail\n{GHA_LOG}{src}\ntime_package_mutants {deadline}',
         ],
         cwd=mod,
         env=env,
@@ -4715,6 +4721,7 @@ def test_workflow_plans_then_shards_the_run(tmp: Path) -> None:
         check=False,
         env={
             **os.environ,
+            'GITHUB_WORKSPACE': str(sized),
             'REPO': 'x',
             'SHA': FIXTURE_SHA,
             'MODULES': '. tools',
@@ -4771,6 +4778,7 @@ def test_workflow_plans_then_shards_the_run(tmp: Path) -> None:
             check=False,
             env={
                 **os.environ,
+                'GITHUB_WORKSPACE': str(sized),
                 'REPO': 'x',
                 'SHA': FIXTURE_SHA,
                 'MODULES': '. tools',
@@ -4867,6 +4875,7 @@ def test_workflow_plans_then_shards_the_run(tmp: Path) -> None:
             check=False,
             env={
                 **os.environ,
+                'GITHUB_WORKSPACE': str(ran),
                 'REPO': 'x',
                 'MODULES': '. tools',
                 'JOB_TIMEOUT_MINUTES': '350',
@@ -4925,6 +4934,7 @@ def test_workflow_plans_then_shards_the_run(tmp: Path) -> None:
         check=False,
         env={
             **os.environ,
+            'GITHUB_WORKSPACE': str(ran),
             'REPO': 'x',
             'MODULES': '. tools',
             'JOB_TIMEOUT_MINUTES': '350',
@@ -5028,7 +5038,7 @@ def test_workflow_carries_costs_between_runs(tmp: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
-        env={**os.environ, 'KEY': 'b-c~tools', 'REF': 'main'},
+        env={**os.environ, 'GITHUB_WORKSPACE': str(work), 'KEY': 'b-c~tools', 'REF': 'main'},
     )
     calls = (work / 'calls').read_text() if (work / 'calls').exists() else ''
     check(
@@ -5348,7 +5358,7 @@ def test_shard_prices_a_probe_under_its_tick_as_unknown(tmp: Path) -> None:
                 e['files'][unit]['work_secs'],
             )
         )
-        texts = [mutation_cost.render(w) for w in warnings]
+        texts = [workflow_commands.render(w) for w in warnings]
         if want == 'measured':
             check(
                 f'tick: {label}: measured history wins over the unknown probe',
@@ -5396,7 +5406,7 @@ def test_shard_prices_an_integration_module_with_no_mutants_at_nothing(tmp: Path
     with contextlib.redirect_stderr(io.StringIO()):
         plan, warnings = shard.assign(doc, history)
     e = plan['modules']['.']
-    texts = [mutation_cost.render(w) for w in warnings]
+    texts = [workflow_commands.render(w) for w in warnings]
     check(
         'integration: no mutants with a cost history is priced at 0, with no mutant to estimate',
         ok=e['cost'] == 'measured' and e['work_secs'] == 0.0 and not texts,
@@ -5602,7 +5612,7 @@ def test_shard_gives_each_unsized_module_a_shard_of_its_own(tmp: Path) -> None:
         )
 
     def note(plan: dict) -> str:
-        return mutation_cost.render(mutation_cost.cap_note('r', plan) or t'')
+        return workflow_commands.render(mutation_cost.cap_note('r', plan) or t'')
 
     sized = {'capped': 'a cap of 16 shards', 'shards': 2, 'projected_minutes': [250.0, None]}
     sized['top_minutes'] = 137.3
@@ -5875,6 +5885,7 @@ def test_workflow_runs_a_repo_it_cannot_read_in_its_own_call(tmp: Path) -> None:
                 'PATH': f'{tmp / "bin"}:{os.environ["PATH"]}',
                 'ONLY': '',
                 'TREES': str(trees),
+                'GITHUB_WORKSPACE': str(tmp),
                 'GITHUB_OUTPUT': str(out),
                 'GITHUB_STEP_SUMMARY': str(summary),
             },
@@ -5902,9 +5913,9 @@ def test_workflow_runs_a_repo_it_cannot_read_in_its_own_call(tmp: Path) -> None:
         and outputs == {'repos': ['a', 'down', 'go', 'z']}
         and '::warning::down: its Go modules could not be read' in log
         and '### down: its Go modules could not be read' in summary
-        and '  include: a (12000 bytes of non-test Go)' in log
-        and '  include: go (24000 bytes of non-test Go)' in log
-        and '  skip:    tiny (100 bytes' in log,
+        and '- include: a (12000 bytes of non-test Go)' in log
+        and '- include: go (24000 bytes of non-test Go)' in log
+        and '- skip:    tiny (100 bytes' in log,
         detail=f'{rc} {outputs} {log[-600:]}',
     )
     t0 = time.monotonic()
@@ -6003,6 +6014,7 @@ def test_workflow_shard_step_plans_the_call(tmp: Path) -> None:
             check=False,
             env={
                 **os.environ,
+                'GITHUB_WORKSPACE': str(work),
                 'REPO': 'a',
                 'KEY': 'a~',
                 'GITHUB_OUTPUT': str(out),

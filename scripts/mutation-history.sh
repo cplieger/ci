@@ -8,6 +8,9 @@
 # Usage: mutation-history.sh NAME REF OUTDIR FILE; needs GH_TOKEN with actions: read and GITHUB_REPOSITORY.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
+
 name="${1:?artifact name}"
 ref="${2:?ref}"
 out="${3:?output dir}"
@@ -24,7 +27,7 @@ list() {
     --jq '.artifacts[]' >"${work}/list.jsonl"
 }
 if ! retry list; then
-  echo "::warning::${name}: the artifact list could not be read, so this run has no history"
+  gha_annotate warning '%s: the artifact list could not be read, so this run has no history' "${name}"
   exit 0
 fi
 id=$(jq -rs --arg ref "${ref}" '
@@ -33,20 +36,20 @@ id=$(jq -rs --arg ref "${ref}" '
     and .workflow_run.head_repository_id == .workflow_run.repository_id))
   | sort_by(.created_at) | last | .id // empty' "${work}/list.jsonl")
 if [ -z "${id}" ]; then
-  echo "${name}: no earlier run on ${ref} left one, so this run has no history"
+  gha_say '%s: no earlier run on %s left one, so this run has no history' "${name}" "${ref}"
   exit 0
 fi
 download() {
   gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}/zip" >"${work}/a.zip"
 }
 if ! retry download; then
-  echo "::warning::${name}: artifact ${id} could not be downloaded, so this run has no history"
+  gha_annotate warning '%s: artifact %s could not be downloaded, so this run has no history' "${name}" "${id}"
   exit 0
 fi
 if ! unzip -p "${work}/a.zip" "${file}" >"${work}/file" || [ ! -s "${work}/file" ]; then
-  echo "::warning::${name}: artifact ${id} has no readable ${file}, so this run has no history"
+  gha_annotate warning '%s: artifact %s has no readable %s, so this run has no history' "${name}" "${id}" "${file}"
   exit 0
 fi
 mkdir -p "${out}"
 mv "${work}/file" "${out}/${file}"
-echo "${name}: history from artifact ${id}"
+gha_say '%s: history from artifact %s' "${name}" "${id}"

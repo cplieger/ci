@@ -57,6 +57,20 @@ jobs:
           # gitleaks step, which moved to the meta ci.yaml `repo` job. Nothing
           # left in this job reads git history.
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # The shellcheck step finds every *.sh in the workspace.
+      - name: Move the ci source out of the workspace
+        run: |
+          set -euo pipefail
+          mv "$GITHUB_WORKSPACE/.cplieger-ci" "$RUNNER_TEMP/cplieger-ci"
+
       # actionlint, zizmor and gitleaks are NOT installed here: they are
       # repo-wide checks with no shell dependency, and they run exactly once in
       # the meta ci.yaml `repo` job. They used to run here AND in go-ci, so a
@@ -112,8 +126,10 @@ jobs:
           # Via env, never inline ${{ }} in the script body, so the input can't
           # expand into shell code (template injection).
           SHELLCHECK_PATHS: ${{ inputs.shellcheck-paths }}
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
         run: |
           (
+            . "$CI_TOOLS/gha-log.sh"
             if [ "$SHELLCHECK_PATHS" = "/dev/null" ]; then
               echo "shellcheck: skipped (no shell scripts)"
             elif [ "$SHELLCHECK_PATHS" = "auto" ]; then
@@ -138,7 +154,7 @@ jobs:
               files=( $SHELLCHECK_PATHS )
               shopt -u nullglob
               if [ ${#files[@]} -eq 0 ]; then
-                echo "shellcheck: no files matched ${SHELLCHECK_PATHS} — skipping"
+                gha_say 'shellcheck: no files matched %s, skipping' "${SHELLCHECK_PATHS}"
               else
                 shellcheck -x -S info "${files[@]}"
               fi

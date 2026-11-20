@@ -19,6 +19,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import workflow_commands
+
 NAME_RE = re.compile(r'^[a-z0-9]{1,32}$')
 # A release version from 1.0.0 on (vX.Y.Z or vX.Y.Z-pre) also moves its major's tag.
 # Major 0 moves none, because a breaking change below 1.0.0 takes only the next
@@ -149,8 +151,11 @@ def plan(root: Path, args: argparse.Namespace) -> list[dict]:
         )
     if unknown := sorted(set(licenses) - set(names)):
         print(
-            f'::warning::the release policy names runner image {", ".join(unknown)}, '
-            'which has no images/<name>/Dockerfile here',
+            workflow_commands.command(
+                'warning',
+                f'the release policy names runner image {", ".join(unknown)}, '
+                'which has no images/<name>/Dockerfile here',
+            ),
             file=sys.stderr,
         )
     texts = {n: d.read_text() for n, d in zip(names, dockerfiles, strict=True)}
@@ -312,7 +317,7 @@ def bake(plan_json: str, platform: str, context: str, package: str) -> dict:
 
 
 def note(msg: str) -> None:
-    print(f'::notice::{msg}', file=sys.stderr)
+    print(workflow_commands.command('notice', msg), file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -349,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
     except PlanError as e:
-        print(f'::error::{e}', file=sys.stderr)
+        print(workflow_commands.command('error', e), file=sys.stderr)
         return 1
     return 0
 

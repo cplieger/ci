@@ -33,6 +33,7 @@ from pathlib import Path
 import ghrest
 import release_channels
 import tracker_issue
+import workflow_commands
 
 OWNER = 'cplieger'
 PRESET = 'github>cplieger/.github'
@@ -1854,7 +1855,7 @@ def write_issue(name, mode, text):
         try:
             return tracker_issue.main(argv, allow_reserved=True)
         except Exception as err:  # one repo's failure must not stop the others
-            print(f'::error::{name}: {err}', file=sys.stderr)
+            print(workflow_commands.command('error', f'{name}: {err}'), file=sys.stderr)
             return 1
 
 
@@ -1864,10 +1865,10 @@ def load_findings(path):
     try:
         findings = json.loads(Path(path).read_text())
     except OSError as err:
-        sys.stderr.write(f'error: findings file unreadable: {err}\n')
+        workflow_commands.say(t'error: findings file unreadable: {err}', file=sys.stderr)
         return None
     except ValueError as err:
-        sys.stderr.write(f'error: findings file is not JSON: {err}\n')
+        workflow_commands.say(t'error: findings file is not JSON: {err}', file=sys.stderr)
         return None
     if not isinstance(findings, dict) or not isinstance(findings.get('repos'), list):
         sys.stderr.write('error: findings file has no repos list\n')
@@ -1905,16 +1906,24 @@ def file_issues(path, dry_run):
         # private ones.
         if row.get('visibility') != 'public':
             counts['private'] += 1
-            print(f'::notice::{name}: not public, so its findings stay in the run summary')
+            print(
+                workflow_commands.command(
+                    'notice', f'{name}: not public, so its findings stay in the run summary'
+                )
+            )
             continue
         if row.get('in_grace') is not False:
             counts['grace'] += 1
-            print(f'{name}: skipped, created less than {GRACE // timedelta(hours=1)}h ago')
+            workflow_commands.say(
+                t'{name}: skipped, created less than {GRACE // timedelta(hours=1)}h ago'
+            )
             continue
         # A partial read never opens, edits or closes an issue.
         if row.get('errors') is not False:
             counts['errors'] += 1
-            print(f"{name}: skipped, this run's read hit API errors (its issue is left as it is)")
+            workflow_commands.say(
+                t"{name}: skipped, this run's read hit API errors (its issue is left as it is)"
+            )
             continue
         hard = row.get('hard') or []
         warn = row.get('warnings') or []
@@ -1924,7 +1933,9 @@ def file_issues(path, dry_run):
             counts['disabled'] += 1
         if dry_run:
             note = '' if row.get('has_issues') else ' (issues disabled, so the tracker skips it)'
-            print(f'{name}: would {mode} ({len(hard)} HARD, {len(warn)} warnings){note}')
+            workflow_commands.say(
+                t'{name}: would {mode} ({len(hard)} HARD, {len(warn)} warnings){note}'
+            )
             continue
         text = (
             issue_body(hard, warn, run)
@@ -1940,7 +1951,7 @@ def file_issues(path, dry_run):
         f' · {counts["private"]} not public · {len(failed)} failed'
     )
     if failed:
-        sys.stderr.write(f'error: filing failed for {", ".join(failed)}\n')
+        workflow_commands.say(t'error: filing failed for {", ".join(failed)}', file=sys.stderr)
         return 1
     return 0
 
@@ -1994,7 +2005,7 @@ def main():
     try:
         all_metas = REST.pages('user/repos?affiliation=owner')
     except ghrest.ApiError as err:
-        sys.stderr.write(f'repo listing failed: {err}\n')
+        workflow_commands.say(t'repo listing failed: {err}', file=sys.stderr)
         sys.exit(2)
     # Forks keep upstream's governance, so they are listed and skipped.
     forks = sorted(m['name'] for m in all_metas if m.get('fork') and not m['archived'])
@@ -2010,8 +2021,9 @@ def main():
         known = {m['name'] for m in metas}
         unknown = sorted(want - known)
         if unknown:
-            sys.stderr.write(
-                f'error: unknown (or archived/fork/filtered) repo(s): {", ".join(unknown)}\n'
+            workflow_commands.say(
+                t'error: unknown (or archived/fork/filtered) repo(s): {", ".join(unknown)}',
+                file=sys.stderr,
             )
             sys.exit(2)
         metas = [m for m in metas if m['name'] in want]
@@ -2058,7 +2070,9 @@ def main():
     hard_total, warn_total, accepted_total, error_total, clean = 0, 0, 0, 0, 0
     grace_total = sum(s.get('tags_in_grace') or 0 for s in settings)
     scope = f', repos={",".join(sorted(set(args.repo)))}' if args.repo else ''
-    print(f'GOVERNANCE COMPLIANCE — {len(settings)} repos (visibility={args.visibility}{scope})')
+    workflow_commands.say(
+        t'GOVERNANCE COMPLIANCE — {len(settings)} repos (visibility={args.visibility}{scope})'
+    )
     print(
         'Legend: [HARD] blocks compliance · [warn] advisory · [error] API '
         'read failed (check skipped) · GHAS scanning N/A on free private '
@@ -2068,10 +2082,10 @@ def main():
     # A set host with no readable hooks anywhere is an under-scoped token (it
     # needs the classic 'repo' scope or admin:repo_hook).
     if forks:
-        print(
-            f'Note: {len(forks)} fork(s) skipped (upstream governance applies): '
-            f'{", ".join(forks)}\n'
+        workflow_commands.say(
+            t'Note: {len(forks)} fork(s) skipped (upstream governance applies): {", ".join(forks)}'
         )
+        print()
     if not WEBHOOK_HOST:
         print('Note: deploy-trigger webhook check skipped (AUDIT_WEBHOOK_HOST unset).\n')
     elif not any(s['webhook_readable'] for s in settings):
@@ -2089,11 +2103,12 @@ def main():
         )
     deferred = sorted(s['name'] for s in settings if s.get('version_tags_deferred'))
     if deferred:
-        print(
-            f'Note: version tags not graded on {len(deferred)} repo(s) with a workflow '
-            f'run live or ended within {RECEIPT_GRACE // timedelta(hours=1)}h: '
-            f'{", ".join(deferred)}\n'
+        workflow_commands.say(
+            t'Note: version tags not graded on {len(deferred)} repo(s) with a workflow '
+            t'run live or ended within {RECEIPT_GRACE // timedelta(hours=1)}h: '
+            t'{", ".join(deferred)}'
         )
+        print()
     now = datetime.now(UTC)
     rows = []
     for meta, s in zip(metas, settings, strict=True):
@@ -2120,15 +2135,15 @@ def main():
         if not hard and not warn and not errors:
             clean += 1
             continue
-        print(f'{s["name"]}  ({tag})')
+        workflow_commands.say(t'{s["name"]}  ({tag})')
         for h in hard:
-            print(f'  [HARD] {h}')
+            workflow_commands.say(t'  [HARD] {h}')
             hard_total += 1
         for w in warn:
-            print(f'  [warn] {w}')
+            workflow_commands.say(t'  [warn] {w}')
             warn_total += 1
         for e in errors:
-            print(f'  [error] {e}')
+            workflow_commands.say(t'  [error] {e}')
             error_total += 1
         print()
 

@@ -1,6 +1,6 @@
 {
  "rc": 0,
- "stdout": "::notice::cplieger/e: skipped, repo is a fork\n::group::cplieger/a\n  1 file(s) differ: .editorconfig\n  opened PR: https://github.com/cplieger/a/pull/99\n::endgroup::\n::group::cplieger/b\n  in sync (no diff)\n  closed stale sync PR #5\n::endgroup::\n::group::cplieger/c\n  in sync (no diff)\n::endgroup::\n::group::cplieger/d\n  1 file(s) differ: .prettierrc.json\n  PR already open; force-push refreshed it\n::endgroup::\n\n4 repo(s): 2 synced · 2 already in sync · 0 with pending diffs (dry-run) · 0 failed\n",
+ "stdout": "::notice::cplieger/e: skipped, repo is a fork\n::group::cplieger/a\n-   1 file(s) differ: .editorconfig\n-   opened PR: https://github.com/cplieger/a/pull/99\n::endgroup::\n::group::cplieger/b\n  in sync (no diff)\n  closed stale sync PR #5\n::endgroup::\n::group::cplieger/c\n  in sync (no diff)\n::endgroup::\n::group::cplieger/d\n-   1 file(s) differ: .prettierrc.json\n  PR already open; force-push refreshed it\n::endgroup::\n\n- 4 repo(s): 2 synced · 2 already in sync · 0 with pending diffs (dry-run) · 0 failed\n",
  "git": [
   [
    "<root>",

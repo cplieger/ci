@@ -61,6 +61,8 @@ def run_body(body: str, cwd: Path, env: dict) -> subprocess.CompletedProcess:
 
 APP_STEPS = [
     'actions/checkout',
+    'Check out the ci source',
+    'Move the ci source out of the build context',
     'docker/setup-buildx-action',
     'Resolve OS package refresh key',
     'Build image (no push, no scan)',
@@ -68,8 +70,6 @@ APP_STEPS = [
     'Image test suite',
 ]
 RUNNER_STEPS = [
-    'Check out the ci source',
-    'Move the ci source out of the build context',
     'Setup Python',
     'Build the runner images (no push)',
 ]
@@ -125,7 +125,7 @@ class DockerJob(unittest.TestCase):
     def test_without_runner_images_the_job_runs_the_steps_it_had(self):
         self.assertEqual(self.ran('false'), APP_STEPS)
         self.assertEqual(
-            self.ran('false', {'Build image (no push, no scan)': 'failure'}), APP_STEPS[:4]
+            self.ran('false', {'Build image (no push, no scan)': 'failure'}), APP_STEPS[:6]
         )
         self.assertEqual(
             [label(s) for s in self.job['steps']], APP_STEPS + RUNNER_STEPS + INTEGRATION_STEPS
@@ -144,7 +144,7 @@ class DockerJob(unittest.TestCase):
         self.assertEqual(self.ran(), everything)
         app_red = {'Build image (no push, no scan)': 'failure'}
         self.assertEqual(
-            self.ran(outcomes=app_red), APP_STEPS[:4] + RUNNER_STEPS + INTEGRATION_STEPS
+            self.ran(outcomes=app_red), APP_STEPS[:6] + RUNNER_STEPS + INTEGRATION_STEPS
         )
         self.assertEqual(self.ran(outcomes={'Image test suite': 'failure'}), everything)
 

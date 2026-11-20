@@ -676,7 +676,7 @@ commit_on main "fix: a main-only fix" main.go='package main\n// main-only' >/dev
 DEFAULT_BRANCH=main run_release main maindefault
 chk "M34 a main-default repository's release run is refused at detect" "$(result)" \
   "refused: ::error::release.yaml publishes only from a public, non-fork repository whose default branch is dev (this one: default branch main, private <unknown>, fork <unknown>). Make dev the default branch, or remove the release.yaml caller and publish from the repository's own workflow."
-chk "M34 running no step after Select channel" "$(jq -r '.ran | join(",")' "$RUN.detect.json")" "Checkout (checkout: --cwd),Select channel"
+chk "M34 running no step after Select channel" "$(jq -r '[.ran[] | select(endswith(" (if false)") | not)] | join(",")' "$RUN.detect.json")" "Checkout (checkout: --cwd),Check out the ci source (checkout: --actions-root),Select channel"
 
 # ── 17. queued dev merges: one version each, and a handoff ships in the next ─
 # Runs on one ref queue, so the second merge's detect reads the tags the

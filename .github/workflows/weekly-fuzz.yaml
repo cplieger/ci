@@ -39,7 +39,9 @@ jobs:
           ref: ${{ github.sha }}
           path: _ci
           persist-credentials: false
-          sparse-checkout: scripts/go-units.sh
+          sparse-checkout: |
+            scripts/go-units.sh
+            scripts/gha-log.sh
           sparse-checkout-cone-mode: false
 
       - name: Discover fuzz targets and compute per-module shard counts
@@ -51,6 +53,7 @@ jobs:
           SHARD_BUDGET_SECONDS: "14400"
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           # REST, not the GraphQL `gh repo list`: GraphQL shares a quota the
           # per-repo reads also draw, and this listing is every repo's single
           # point of failure. A fork carries UPSTREAM's code, whose findings we
@@ -69,13 +72,13 @@ jobs:
             # Bounded so a stalled clone drops this repo, not the job's timeout.
             if ! timeout 120 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
               clone --depth 1 "https://github.com/cplieger/${r}.git" scan 2>/dev/null; then
-              echo "::warning::clone failed or timed out for ${r} — dropping it from the fuzz matrix this week"
+              gha_annotate warning 'clone failed or timed out for %s, so it is dropped from the fuzz matrix this week' "${r}"
               continue
             fi
             # A clone can exit 0 with no resolvable HEAD; unguarded under
             # `set -e`, rev-parse would end the fanout for every repo.
             if ! sha=$(git -C scan rev-parse HEAD 2>/dev/null); then
-              echo "::warning::cannot resolve HEAD for ${r}, so it is dropped from the fuzz matrix this week"
+              gha_annotate warning 'cannot resolve HEAD for %s, so it is dropped from the fuzz matrix this week' "${r}"
               continue
             fi
             # One unit per Go module, the root and each nested one, since a
@@ -83,7 +86,7 @@ jobs:
             # proxy for `go test -list '^Fuzz'` that only sizes the shards; each
             # shard recomputes the exact list at run time.
             if ! units=$(bash _ci/scripts/go-units.sh scan '^func Fuzz'); then
-              echo "::warning::module discovery failed for ${r}, so it is dropped from the fuzz matrix this week"
+              gha_annotate warning 'module discovery failed for %s, so it is dropped from the fuzz matrix this week' "${r}"
               continue
             fi
             artifacts=()
@@ -139,6 +142,16 @@ jobs:
     steps:
       # Anonymous: the fanout lists only public repositories, and this job
       # runs the target's code, so it holds no secret.
+      - name: Checkout ci (for gha-log.sh)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _ci
+          persist-credentials: false
+          sparse-checkout: scripts/gha-log.sh
+          sparse-checkout-cone-mode: false
+
       - name: Clone target repo at pinned SHA
         env:
           REPO: ${{ matrix.repo }}
@@ -166,6 +179,7 @@ jobs:
           GOWORK: "off"
         run: |
           set -uo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           : > "$GITHUB_WORKSPACE/findings.txt"
           : > "$GITHUB_WORKSPACE/broken.txt"
           # Deterministic global target list: `go list ./...` is import-path
@@ -186,7 +200,7 @@ jobs:
             if [ $(( idx % SHARDS )) -eq "$SHARD" ]; then
               pkg="${entry%%|*}"
               fn="${entry##*|}"
-              echo "::group::fuzz ${fn} (${pkg})"
+              gha_annotate group 'fuzz %s (%s)' "${fn}" "${pkg}"
               out=$(go test -run='^$' -fuzz="^${fn}$" -fuzztime="${FUZZ_TIME_SECONDS}s" "$pkg" 2>&1) && status=0 || status=$?
               printf '%s\n' "$out"
               rel=$(printf '%s\n' "$out" | sed -nE 's@.*Failing input written to (testdata/fuzz/[^[:space:]]+).*@\1@p' | head -1)
@@ -214,7 +228,7 @@ jobs:
                 # The shard fails rather than filing an issue, because no seed
                 # commit could ever auto-close one.
                 printf '%s (%s)\n' "$fn" "$pkg" >> "$GITHUB_WORKSPACE/broken.txt"
-                echo "::error::${fn} (${pkg}) failed without writing a reproducer — broken seed corpus or build failure, see the group log"
+                gha_annotate error '%s (%s) failed without writing a reproducer, from a broken seed corpus or a build failure (see the group log)' "${fn}" "${pkg}"
               fi
               echo "::endgroup::"
               ran=$((ran + 1))
@@ -277,7 +291,9 @@ jobs:
           sparse-checkout: |
             scripts/tracker_issue.py
             scripts/ghrest.py
+            scripts/workflow_commands.py
             scripts/go-units.sh
+            scripts/gha-log.sh
           sparse-checkout-cone-mode: false
           path: ci
 
@@ -294,6 +310,7 @@ jobs:
         working-directory: target
         run: |
           set -uo pipefail
+          . "$GITHUB_WORKSPACE/ci/scripts/gha-log.sh"
           tracker="$GITHUB_WORKSPACE/ci/scripts/tracker_issue.py"
           had_failure=0
 
@@ -372,7 +389,7 @@ jobs:
               fi
             done
             if ! seedpath=$(find "$start" ${prune[@]+"${prune[@]}"} -path "*/testdata/fuzz/${target}/${hash}" -print -quit); then
-              echo "::warning::the seed search for '${title}' failed, so the issue stays open this week"
+              gha_annotate warning "the seed search for '%s' failed, so the issue stays open this week" "${title}"
               had_failure=1
               continue
             fi
@@ -385,7 +402,7 @@ jobs:
           done < "$RUNNER_TEMP/open-findings.tsv"
 
           if [ "$had_failure" -ne 0 ]; then
-            echo "::error::one or more issue operations failed for ${REPO}"
+            gha_annotate error 'one or more issue operations failed for %s' "${REPO}"
             exit 1
           fi
 

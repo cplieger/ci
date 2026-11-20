@@ -10,6 +10,8 @@
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$TOOLS/gha-log.sh"
 # shellcheck source=SCRIPTDIR/retry.sh
 . "$TOOLS/retry.sh"
 
@@ -22,7 +24,7 @@ BINARY_TARGETS=(linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 
 BINARY_LIST=binary-assets.txt
 
 die() {
-  echo "::error::$*" >&2
+  gha_annotate error '%s' "$*" >&2
   exit 1
 }
 
@@ -170,7 +172,7 @@ cmd_cleanup_drafts() { # <tag>
   gh api --paginate "repos/${GITHUB_REPOSITORY:?}/releases?per_page=100" \
     | jq -r --arg v "$tag" '.[] | select(.draft and .tag_name == $v) | .id' \
     | while IFS= read -r id; do
-      echo "::notice::deleting orphaned draft release ${id} for ${tag}"
+      gha_annotate notice 'deleting orphaned draft release %s for %s' "${id}" "${tag}"
       gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
     done
 }

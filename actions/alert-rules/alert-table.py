@@ -15,6 +15,9 @@ import sys
 
 import yaml
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'scripts'))
+import workflow_commands as wc
+
 PAGE = pathlib.Path('docs/monitoring.md')
 HEADER = re.compile(r'^\|\s*Alert\s*\|')
 SEPARATOR = re.compile(r'^\|[\s:|-]+$')
@@ -23,7 +26,7 @@ NAME = re.compile(r'`([^`]+)`')
 
 
 def error(path: str, message: str) -> None:
-    print(f'::error file={path}::{message}')
+    print(wc.command('error', message, file=path))
 
 
 def rule_alerts(paths: list[pathlib.Path]) -> tuple[dict[str, list[str]], bool]:

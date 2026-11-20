@@ -166,6 +166,7 @@ jobs:
           KEY: ${{ matrix.key }}
         run: |
           set -uo pipefail
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
           ci="${GITHUB_WORKSPACE}"
           plan_args=(--repo "${REPO}" --dir "${DIR}" --sha "${SHA}"
             --config stryker.config.json --out "${ci}/plan/${KEY}.json")
@@ -176,7 +177,7 @@ jobs:
             0) python3 "${ci}/scripts/stryker-shard.py" plan "${plan_args[@]}" --pass "${RUNNER_TEMP}/pass.json" ;;
             3) python3 "${ci}/scripts/stryker-shard.py" plan "${plan_args[@]}" --skipped ;;
             *)
-              echo "::error::${REPO}:${DIR}: the plan pass failed (exit ${rc}), so the entry runs in one job"
+              gha_annotate error '%s:%s: the plan pass failed (exit %s), so the entry runs in one job' "${REPO}" "${DIR}" "${rc}"
               exit "${rc}"
               ;;
           esac
@@ -425,7 +426,8 @@ jobs:
           RC: ${{ steps.stryker.outputs.rc }}
           ENTRY: ${{ matrix.repo }}:${{ matrix.dir }}
         run: |
-          echo "::error::${ENTRY}: stryker exited ${RC:-before it ran} without finishing"
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
+          gha_annotate error '%s: stryker exited %s without finishing' "${ENTRY}" "${RC:-before it ran}"
           exit 1
 
   # Per entry, running no target code: its shards' results as one run's report
@@ -504,7 +506,8 @@ jobs:
         env:
           ENTRY: ${{ matrix.repo }}:${{ matrix.dir }}
         run: |
-          echo "::error::${ENTRY}: mutation score fell below the config's thresholds.break"
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
+          gha_annotate error "%s: mutation score fell below the config's thresholds.break" "${ENTRY}"
           exit 1
 
   # Publish each entry's mutation-ts badge from the score its run staged. The
@@ -563,13 +566,14 @@ jobs:
           ENTRY: ${{ matrix.repo }}:${{ matrix.dir }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
           if [ ! -f artifact/meta.json ]; then
             echo "${ENTRY}: no report was staged, so no badge is published"
             exit 0
           fi
           score=$(jq -r '.score // ""' artifact/meta.json 2>/dev/null) || score=""
           if ! [[ $score =~ ^[0-9]{1,3}(\.[0-9]+)?$ ]]; then
-            echo "::error::${ENTRY}: the staged score is not a number, so no badge was published"
+            gha_annotate error '%s: the staged score is not a number, so no badge was published' "${ENTRY}"
             exit 1
           fi
           # Colour bands match the Go mutation badge (gremlins-aggregate.py).
@@ -631,11 +635,12 @@ jobs:
           REPO: ${{ inputs.repository }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
           # Target code wrote meta.json, so an artifact naming another repo is
           # warned and skipped; stryker-aggregate.py reads only this repo's.
           found=$(bash scripts/discover-artifact-repos.sh --allow "$REPO" artifacts)
           if [ -z "$found" ]; then
-            echo "no report names ${REPO} this week, so its tracker issue is left untouched"
+            gha_say 'no report names %s this week, so its tracker issue is left untouched' "${REPO}"
             exit 0
           fi
           R="cplieger/${REPO}"
@@ -649,7 +654,7 @@ jobs:
             --entries-marker-file "$RUNNER_TEMP/entries.txt" \
             --existing-body-file "$RUNNER_TEMP/existing.md" > "$RUNNER_TEMP/body.md"
           if [ "$(cat "$RUNNER_TEMP/entries.txt" 2>/dev/null || echo 0)" -eq 0 ]; then
-            echo "no parseable reports for ${REPO}, so its tracker issue is left untouched"
+            gha_say 'no parseable reports for %s, so its tracker issue is left untouched' "${REPO}"
             exit 0
           fi
           flag=off

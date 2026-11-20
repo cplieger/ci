@@ -26,6 +26,8 @@ import sys
 import uuid
 from typing import TYPE_CHECKING, Any
 
+import workflow_commands
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
@@ -717,7 +719,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def report(a: argparse.Namespace, text: str) -> None:
-    print(text)
+    workflow_commands.say_lines(text)
     if a.summary:
         with pathlib.Path(a.summary).open('a') as f:
             f.write(text)
@@ -743,8 +745,8 @@ def run_plan(a: argparse.Namespace) -> int:
         }
         with pathlib.Path(a.outputs).open('a') as f:
             f.writelines(github_output(name, value) for name, value in written.items())
-    print(
-        f'{a.out}: {len(matrix["include"])} jobs over {", ".join(matrix["scenarios"]) or "nothing"}'
+    workflow_commands.say(
+        t'{a.out}: {len(matrix["include"])} jobs over {", ".join(matrix["scenarios"]) or "nothing"}'
     )
     return 0
 
@@ -760,7 +762,7 @@ def run(a: argparse.Namespace) -> int:
         out = run_guard(a)
     report(a, guard_summary(out))
     for f in out.failures:
-        print(f'::error::{f}')
+        print(workflow_commands.command('error', f))
     return 1 if out.failures else 0
 
 
@@ -792,7 +794,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return run(a)
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        print(f'::error::perf_gate: {exc!r}', file=sys.stderr)
+        print(workflow_commands.command('error', f'perf_gate: {exc!r}'), file=sys.stderr)
         return 1
 
 

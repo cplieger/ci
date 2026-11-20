@@ -51,6 +51,7 @@ jobs:
           ONLY: ${{ github.event.inputs.only }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
           mkdir -p /tmp/hubsync
 
           # Archived and fork repos are excluded org-wide (an archived repo is
@@ -84,7 +85,7 @@ jobs:
             count=$((count + 1))
           done
 
-          echo "::notice::cloned ${count} image repo(s)"
+          gha_annotate notice 'cloned %s image repo(s)' "${count}"
           if [ "$count" -eq 0 ]; then
             echo "::error::no image repos matched; nothing to sync"
             exit 1

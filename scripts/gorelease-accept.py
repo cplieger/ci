@@ -24,6 +24,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import workflow_commands
+
 ACCEPT_FILE = 'api-accept.txt'
 INCOMPATIBLE = '## incompatible changes'
 # apidiff's messageSet.add (apidiff/messageset.go) prints this three-line note to STDOUT with
@@ -224,11 +226,6 @@ def apply(
     return result
 
 
-def escape(value: str) -> str:
-    """A workflow command's message escaping (%, CR, LF)."""
-    return value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-
-
 def fenced(title: str, lines: list[str]) -> list[str]:
     return [title, '', '```text', *lines, '```', ''] if lines else []
 
@@ -254,8 +251,8 @@ def render(result: Result, rejected: bool) -> list[str]:
 
 
 def annotate(level: str, message: str, lineno: int | None = None) -> None:
-    where = f' file={ACCEPT_FILE},line={lineno}' if lineno else ''
-    print(f'::{level}{where}::{escape(message)}')
+    where = {'file': ACCEPT_FILE, 'line': lineno} if lineno else {}
+    print(workflow_commands.command(level, message, **where))
 
 
 def run(
@@ -317,12 +314,12 @@ def main() -> int:
             args.self_version,
         )
     except InputError as exc:
-        print(f'::error::{escape(str(exc))}')
+        print(workflow_commands.command('error', exc))
         return 2
     text = '\n'.join(lines) + '\n'
     with args.summary.open('a') as f:
         f.write(text)
-    sys.stdout.write(text)
+    workflow_commands.say_lines(text)
     return code
 
 

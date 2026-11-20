@@ -51,6 +51,8 @@ import re
 import statistics
 import sys
 
+import workflow_commands
+
 # Same shape bench-reduce.py parses, and the same GOMAXPROCS-suffix strip, so a
 # series named here is the series that reaches the chart.
 LINE = re.compile(r'^(Benchmark\S*)\s+(\d+)\s+(.*)$')
@@ -143,7 +145,7 @@ def main() -> int:
         with open(path) as fh:
             samples = parse(fh.read())
         if not samples:
-            print(f'{path}: no Benchmark lines found', file=sys.stderr)
+            workflow_commands.say(t'{path}: no Benchmark lines found', file=sys.stderr)
             return 1
         for (name, unit), values in sorted(samples.items()):
             if len(values) < MIN_SAMPLES:

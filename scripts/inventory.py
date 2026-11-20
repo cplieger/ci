@@ -311,9 +311,6 @@ IGNORED_DIRS = frozenset(
 _DOCKERFILE = re.compile(
     r'(?:^|/|\.)(?:[Dd]ocker|[Cc]ontainer)file$|(?:^|/)(?:[Dd]ocker|[Cc]ontainer)file[^/]*$'
 )
-# Keyed by basename, or by repository path where a cplieger/.github preset
-# custom manager's managerFilePatterns is anchored to that one path: a basename
-# key there would make the same name elsewhere a surface Renovate never reads.
 _SURFACE_NAMES = {
     'go.mod': 'gomod',
     'go.sum': 'gosum',
@@ -324,32 +321,20 @@ _SURFACE_NAMES = {
     'bundled-tools.json': 'bundled-tools',
     'entrypoint.sh': 'pins',
     'registries.env': 'pins',
-    'webauthn/aaguids_source.go': 'go-source',
 }
 
 
-# Files, and trees ending in `/`, a Renovate postUpgradeTask regenerates in the
-# commit that moves one pin: no inventory surface, but a function of that pin's
-# version. The cplieger/.github preset's rule for those pins lists them in
-# fileFilters. A tree several pins regenerate is another repository's build for
-# each (fclones' crate licences, ripgrep's), so a move of any one accounts for it.
-REGENERATED_TREES = {
-    'licenses/crates/': ('pkolaczk/fclones', 'BurntSushi/ripgrep'),
-    'webauthn/aaguids_gen.go': ('passkey-authenticator-aaguids',),
-    'webauthn/testdata/aaguid.json': ('passkey-authenticator-aaguids',),
-}
+# Trees a Renovate postUpgradeTask regenerates in the commit that moves one pin,
+# by path prefix: no inventory surface, but a function of that pin's version. The
+# cplieger/.github preset's rule for those pins lists the tree in fileFilters. A tree
+# several pins regenerate is another repository's build for each (fclones' crate
+# licences, ripgrep's), so a move of any one accounts for it.
+REGENERATED_TREES = {'licenses/crates/': ('pkolaczk/fclones', 'BurntSushi/ripgrep')}
 
 
 def regenerated_by(path: str) -> tuple[str, ...]:
     """The pins whose update regenerates `path`, empty when none does."""
-    return next(
-        (
-            deps
-            for tree, deps in REGENERATED_TREES.items()
-            if path == tree or (tree.endswith('/') and path.startswith(tree))
-        ),
-        (),
-    )
+    return next((deps for tree, deps in REGENERATED_TREES.items() if path.startswith(tree)), ())
 
 
 def surface_kind(path: str) -> str | None:
@@ -359,7 +344,7 @@ def surface_kind(path: str) -> str | None:
     parts = path.split('/')
     if parts[0] == '.github' or IGNORED_DIRS.intersection(parts[:-1]):
         return None
-    kind = _SURFACE_NAMES.get(path) or _SURFACE_NAMES.get(parts[-1])
+    kind = _SURFACE_NAMES.get(parts[-1])
     if kind:
         return kind
     return 'dockerfile' if _DOCKERFILE.search(path) else None
@@ -811,8 +796,7 @@ def _pin_records(path: str, attrs: dict, group: list, spans: list) -> list[Recor
     )
     value, digest = first['val'], ''
     spans.append((start + first.start('val'), start + first.end('val')))
-    trail = first.groupdict().get('trail')
-    trailer = _TRAILER_VERSION.search(trail or '') if _HEX.fullmatch(value) else None
+    trailer = _TRAILER_VERSION.search(first['trail'] or '') if _HEX.fullmatch(value) else None
     if trailer:
         at = start + first.start('trail') + trailer.start('tver')
         spans.append((at, at + len(trailer['tver'])))
@@ -868,26 +852,6 @@ def _docker_line(path: str, offset: int, line: str, stages: set, spans: list) ->
     return found
 
 
-# The cplieger/.github preset's Go-source manager matchStrings in Python syntax:
-# a looser pattern records a value Renovate never moves, a stricter one hides a pin.
-_GO_PIN = re.compile(
-    r'//\s*renovate:\s*datasource=git-refs\s+depName=(?P<depName>\S+)\s+'
-    r'packageName=(?P<packageName>\S+)\s+branch=(?P<branch>\S+)\s*\n'
-    r'const\s+(?P<name>\w+)\s*=\s*"(?P<val>[a-f0-9]{40})"',
-    re.ASCII,
-)
-
-
-def parse_go_source(path: str, text: str) -> tuple[list[Record], str]:
-    """The `// renovate:` git-refs branch pins of a Go source file."""
-    records: list[Record] = []
-    spans: list[tuple[int, int]] = []
-    for m in _GO_PIN.finditer(text):
-        attrs = {'datasource': 'git-refs', 'depName': m['depName'], 'branch': m['branch']}
-        records += _pin_records(path, attrs, [(0, m)], spans)
-    return records, _mask(text, spans)
-
-
 PARSERS = {
     'gomod': parse_go_mod,
     'package-json': parse_package_json,
@@ -896,10 +860,9 @@ PARSERS = {
     'bundled-tools': parse_bundled_tools,
     'pins': parse_pins,
     'dockerfile': lambda path, text: parse_pins(path, text, dockerfile=True),
-    'go-source': parse_go_source,
 }
 # The surfaces of `renovate:` marker pins, whose parsers never refuse a file.
-_MARKER_PIN_KINDS = frozenset({'pins', 'dockerfile', 'go-source'})
+_MARKER_PIN_KINDS = frozenset({'pins', 'dockerfile'})
 
 
 class Repo:

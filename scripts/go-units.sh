@@ -9,6 +9,9 @@
 # is skipped with a ::warning::.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
+
 [ "$#" -ge 1 ] && [ "$#" -le 2 ] || {
   echo "usage: $(basename -- "$0") <tree> [<regex>]" >&2
   exit 2
@@ -16,7 +19,7 @@ set -euo pipefail
 tree=${1%/}
 regex=${2:-}
 [ -d "$tree" ] || {
-  echo "go-units: $tree is not a directory" >&2
+  gha_say 'go-units: %s is not a directory' "$tree" >&2
   exit 2
 }
 
@@ -30,11 +33,7 @@ while IFS= read -r -d '' f; do
   d=$(dirname -- "${f#"$tree"/}")
   case "$d" in
     *[!A-Za-z0-9._/-]*)
-      # Escaped as gha-log.sh's gha_escape, inlined because callers sparse-check-out this file alone.
-      e=${d//%/%25}
-      e=${e//$'\r'/%0D}
-      e=${e//$'\n'/%0A}
-      echo "::warning::go-units: skipped module dir '$e', which holds a character outside A-Z, a-z, 0-9, '.', '_', '-' and '/'" >&2
+      gha_annotate warning "go-units: skipped module dir '%s', which holds a character outside A-Z, a-z, 0-9, '.', '_', '-' and '/'" "$d" >&2
       continue
       ;;
   esac
@@ -48,7 +47,7 @@ declare -A taken=()
 for d in "${mods[@]}"; do
   if [ "$d" = . ]; then slug=root; else slug=${d//\//_}; fi
   if [ -n "${taken[$slug]:-}" ]; then
-    echo "::warning::go-units: skipped module dir '$d', because module dir '${taken[$slug]}' already has slug '$slug'" >&2
+    gha_annotate warning "go-units: skipped module dir '%s', because module dir '%s' already has slug '%s'" "$d" "${taken[$slug]}" "$slug" >&2
     continue
   fi
   taken[$slug]=$d

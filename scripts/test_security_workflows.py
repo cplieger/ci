@@ -565,7 +565,13 @@ class DailySecurity(unittest.TestCase):
         log = self.base / 'calls'
         log.write_text('')
         (self.base / 'repos.json').write_text(json.dumps(REPOS))
+        # The job's ci checkout, as the step finds it.
+        workspace = self.base / 'workspace'
+        if not workspace.exists():
+            workspace.mkdir()
+            (workspace / '_ci').symlink_to(ROOT)
         env.update(
+            GITHUB_WORKSPACE=str(workspace),
             PATH=f'{self.base}:{os.environ["PATH"]}',
             STUB_LOG=str(log),
             STUB_REPOS=str(self.base / 'repos.json'),
@@ -575,8 +581,11 @@ class DailySecurity(unittest.TestCase):
         self.assertEqual(proc.returncode, rc, proc.stderr)
         return log.read_text()
 
+    def dispatch_steps(self) -> list[dict]:
+        return [s for s in self.wf['jobs']['dispatch']['steps'] if 'run' in s]
+
     def test_each_row_runs_exactly_one_dispatch_and_a_default_row_runs_head_s_call(self):
-        steps = self.wf['jobs']['dispatch']['steps']
+        steps = self.dispatch_steps()
         (old,) = self.head['dispatch-steps']
         self.assertEqual(steps[0]['name'], old['name'])
         for row, want in (
@@ -596,14 +605,14 @@ class DailySecurity(unittest.TestCase):
         )
 
     def test_a_default_branch_that_cannot_be_read_dispatches_nothing(self):
-        step = self.wf['jobs']['dispatch']['steps'][0]
+        step = self.dispatch_steps()[0]
         calls = self.dispatch(step, {'repo': 'docker-age'}, rc=1, STUB_READ_FAILS='1')
         self.assertNotIn('workflow run', calls)
         calls = self.dispatch(step, {'repo': 'not-listed'}, rc=1)
         self.assertNotIn('workflow run', calls)
 
     def test_the_main_dispatch_passes_the_ref(self):
-        step = self.wf['jobs']['dispatch']['steps'][1]
+        step = self.dispatch_steps()[1]
         self.assertEqual(
             self.dispatch(step, {'repo': 'subflux', 'ref': 'main'}),
             'workflow run security.yml -R cplieger/subflux --ref main\n',

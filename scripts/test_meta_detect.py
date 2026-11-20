@@ -15,7 +15,7 @@ from pathlib import Path
 
 import workflow_replay as wr
 import yaml
-from test_deadset_steps import GO_CI, META, Harness, git_repo, run_detect, workflow_step
+from test_deadset_steps import GO_CI, META, ROOT, Harness, git_repo, run_detect, workflow_step
 
 GO_FILE = 'package m\n'
 SENTINEL = 'module web-ignore\n'
@@ -98,7 +98,9 @@ class TsNested(Harness):
     def test_validate_fails_on_a_failed_half(self):
         validate = workflow()['jobs']['validate']
         self.assertIn('ts-nested', validate['needs'])
-        step = validate['steps'][0]
+        step = next(
+            s for s in validate['steps'] if s.get('name') == 'Aggregate CI dispatch results'
+        )
         self.assertEqual(step['env']['TS_NESTED'], '${{ needs.ts-nested.result }}')
         self.assertIn('"ts-nested=$TS_NESTED"', step['run'])
 
@@ -288,6 +290,7 @@ class GoWorkStep(Harness):
             'GOTOOLCHAIN': 'local',
             'GOPROXY': 'off',
             'GIT_CONFIG_GLOBAL': '/dev/null',
+            'CI_TOOLS': str(ROOT / 'scripts'),
         }
         return subprocess.run(
             ['bash', '-e', '-c', step['run']],
@@ -332,7 +335,9 @@ class GoWorkWiring(unittest.TestCase):
     def test_validate_fails_on_a_failed_workspace_job(self):
         validate = workflow()['jobs']['validate']
         self.assertIn('go-work', validate['needs'])
-        step = validate['steps'][0]
+        step = next(
+            s for s in validate['steps'] if s.get('name') == 'Aggregate CI dispatch results'
+        )
         self.assertEqual(step['env']['GO_WORK'], '${{ needs.go-work.result }}')
         self.assertIn('"go-work=$GO_WORK"', step['run'])
 

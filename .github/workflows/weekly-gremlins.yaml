@@ -36,7 +36,9 @@ jobs:
           ref: ${{ github.sha }}
           path: _ci
           persist-credentials: false
-          sparse-checkout: scripts/go-units.sh
+          sparse-checkout: |
+            scripts/go-units.sh
+            scripts/gha-log.sh
           sparse-checkout-cone-mode: false
 
       - name: Discover Go-having repos with non-trivial source
@@ -48,6 +50,7 @@ jobs:
           ONLY: ${{ github.event.inputs.only }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           # Repo discovery over REST, not the GraphQL `gh repo list`: the fanout
           # is a single point of failure for the whole run, and GraphQL shares a
           # quota the per-repo reads draw too, so a quota exhaustion there loses
@@ -70,7 +73,7 @@ jobs:
               case "$wanted" in *" $r "*) filtered="$filtered $r" ;; esac
             done
             repos="$filtered"
-            echo "manual 'only' filter active -> ${repos:-<none matched>}"
+            gha_say "manual 'only' filter active -> %s" "${repos:-<none matched>}"
           fi
 
           # Keep repos that:
@@ -82,7 +85,7 @@ jobs:
           # visibly if the repo cannot be tested, and the others run on.
           GO_REPOS=()
           fault() {
-            echo "::warning::$1"
+            gha_annotate warning '%s' "$1"
             echo "### $1" >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
           }
           units_err=$(mktemp)
@@ -113,9 +116,9 @@ jobs:
               | awk '{ n += $1 } END { print n + 0 }')
             if [ "$loc" -ge 10000 ]; then
               GO_REPOS+=("$r")
-              echo "  include: ${r} (${loc} bytes of non-test Go)"
+              gha_say 'include: %s (%s bytes of non-test Go)' "${r}" "${loc}"
             else
-              echo "  skip:    ${r} (${loc} bytes — below 200 LOC threshold)"
+              gha_say 'skip:    %s (%s bytes, below the 200 LOC threshold)' "${r}" "${loc}"
             fi
           done
 

@@ -615,6 +615,8 @@ class StrykerBadge(unittest.TestCase):
         stub = tmp / 'cwd' / PUBLISHER_STUB_PATH
         stub.parent.mkdir(parents=True)
         stub.write_text(PUBLISH_BADGE_STUB)
+        (tmp / 'cwd' / 'scripts').mkdir()
+        (tmp / 'cwd' / 'scripts' / 'gha-log.sh').symlink_to(SCRIPTS / 'gha-log.sh')
         if meta is not None:
             (tmp / 'cwd' / 'artifact').mkdir()
             (tmp / 'cwd' / 'artifact' / 'meta.json').write_text(json.dumps(meta))
@@ -1164,6 +1166,8 @@ class BenchPublish(unittest.TestCase):
     def medians(self, content: str | None) -> tuple[int, dict]:
         tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         (tmp / 'cwd' / 'bench').mkdir(parents=True)
+        (tmp / 'cwd' / '_ci' / 'scripts').mkdir(parents=True)
+        (tmp / 'cwd' / '_ci' / 'scripts' / 'gha-log.sh').symlink_to(SCRIPTS / 'gha-log.sh')
         if content is not None:
             (tmp / 'cwd' / 'bench' / 'bench.json').write_text(content)
         rc, result, _ = replay_job(tmp, 'weekly-bench.yaml', 'publish', list(self.ARGS))
@@ -1271,6 +1275,7 @@ class BenchPerModule(unittest.TestCase):
         )
         (tmp / 'cwd' / '_ci' / 'scripts').mkdir(parents=True)
         (tmp / 'cwd' / '_ci' / 'scripts' / 'bench-fix-attribution.py').write_text(FIX_STUB)
+        (tmp / 'cwd' / '_ci' / 'scripts' / 'gha-log.sh').symlink_to(SCRIPTS / 'gha-log.sh')
         slug = 'root' if dir_ == '.' else dir_
         key = 'go' if dir_ == '.' else f'go/{dir_}'
         args = [
@@ -1326,6 +1331,7 @@ class BenchPerModule(unittest.TestCase):
         scripts.mkdir(parents=True)
         (scripts / 'tracker_issue.py').write_text(LOGGING_TRACKER_STUB)
         (scripts / 'bench-aggregate.py').write_text(AGGREGATE_STUB)
+        (scripts / 'gha-log.sh').symlink_to(SCRIPTS / 'gha-log.sh')
         matrix = [
             {'repo': 'go', 'sha': 'f00d', 'dir': '.', 'slug': 'root', 'key': 'go'},
             {'repo': 'go', 'sha': 'f00d', 'dir': 'jsonx', 'slug': 'jsonx', 'key': 'go/jsonx'},
@@ -1384,7 +1390,10 @@ class FuzzPerModule(unittest.TestCase):
             'x'
         )
         matrix = {'repo': 'go', 'sha': 'f00d', 'dir': 'm', 'slug': 'm', 'shard': 0, 'shards': 1}
-        skip = ['--skip', 'Clone target repo at pinned SHA', '--skip', 'Set up Go']
+        (tmp / 'cwd' / '_ci' / 'scripts').mkdir(parents=True)
+        (tmp / 'cwd' / '_ci' / 'scripts' / 'gha-log.sh').symlink_to(SCRIPTS / 'gha-log.sh')
+        skip = ['--skip', 'Checkout ci (for gha-log.sh)']
+        skip += ['--skip', 'Clone target repo at pinned SHA', '--skip', 'Set up Go']
         skip += ['--skip', 'Upload shard findings']
         rc, result, log = replay_job(
             tmp,
@@ -1435,7 +1444,8 @@ class FuzzPerModule(unittest.TestCase):
         )
         ci = tmp / 'cwd' / 'ci' / 'scripts'
         ci.mkdir(parents=True)
-        (ci / 'go-units.sh').symlink_to(SCRIPTS / 'go-units.sh')
+        for name in ('go-units.sh', 'gha-log.sh'):
+            (ci / name).symlink_to(SCRIPTS / name)
         (ci / 'open.tsv').write_text(''.join(f'1\t{t}\n' for t in open_titles))
         (ci / 'tracker_issue.py').write_text(
             'import pathlib, sys\n'

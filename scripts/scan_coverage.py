@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 
 import promote
+import workflow_commands
 
 SCHEMA = 1
 SEVERITIES = ('HIGH', 'CRITICAL')
@@ -693,7 +694,7 @@ def cmd_sbom(args) -> int:
         record = {'index': args.index, 'documents': signed_sboms(args.repo, args.index)}
     except (ValueError, OSError) as exc:
         record = {'index': args.index, 'error': ' '.join(str(exc).split())}
-        print(f'::warning::signed SBOM: {record["error"]}')
+        print(workflow_commands.command('warning', f'signed SBOM: {record["error"]}'))
     Path(args.out).write_text(json.dumps(record) + '\n')
     return 0
 
@@ -710,7 +711,7 @@ def cmd_summarize(args) -> int:
     with open(args.summary, 'a') as fh:
         fh.write(render(doc) + '\n')
     for e in doc['errors']:
-        print(f'::error::{e}')
+        print(workflow_commands.command('error', e))
     return 0 if doc['complete'] else 1
 
 

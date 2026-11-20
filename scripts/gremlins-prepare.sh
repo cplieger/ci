@@ -75,7 +75,7 @@ for d in "${nested[@]}"; do
 done
 if [ "${#modules[@]}" -eq 0 ]; then
   if [ "${refused}" = '[]' ]; then
-    echo "::error::${repo} has no Go module to measure"
+    gha_annotate error '%s has no Go module to measure' "${repo}"
     exit 1
   fi
   # The runner keeps a failed step's outputs (actions/runner ActionRunner.cs
@@ -85,7 +85,7 @@ if [ "${#modules[@]}" -eq 0 ]; then
     echo "untested="
     echo "refused=$(jq -c . <<<"${refused}")"
   } >>"${GITHUB_OUTPUT}"
-  echo "::error::every Go module dir of ${repo} was refused"
+  gha_annotate error 'every Go module dir of %s was refused' "${repo}"
   exit 1
 fi
 untested=()
@@ -101,7 +101,7 @@ if [ -n "${GREMLINS_MODULE:-}" ]; then
     fi
   done
   if [ "${#selected[@]}" -eq 0 ]; then
-    echo "::error::the module input names no measurable Go module of ${repo}"
+    gha_annotate error 'the module input names no measurable Go module of %s' "${repo}"
     exit 1
   fi
   modules=("${selected[@]}")

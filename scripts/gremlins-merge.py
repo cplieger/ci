@@ -71,6 +71,8 @@ import json
 import sys
 from pathlib import Path
 
+import workflow_commands
+
 # gremlins' mutator.Type.String() values are NOT the JSON keys of
 # mutator_statistics for every type: INVERT_BWASSIGN -> invert_bitwise_assignments
 # and INVERT_LOOPCTRL -> invert_loop_ctrl. The rest are the lowercased string.
@@ -200,7 +202,9 @@ def load_module(dir_: str, path: Path) -> tuple[dict, bool]:
         # gremlins writes no report at all when a module yields no mutants
         # (internal/report.newReport bails on an empty mutant list), so a
         # missing file is a zero-mutant module, not a failure.
-        print(f'[{dir_}] no gremlins output at {path} — treating as 0 mutants', file=sys.stderr)
+        workflow_commands.say(
+            t'[{dir_}] no gremlins output at {path}, so it counts as 0 mutants', file=sys.stderr
+        )
         return {'files': []}, False
     try:
         data = json.loads(path.read_text())
@@ -298,17 +302,17 @@ def merge(modules: list[tuple[str, Path]], skipped: list[str] = ()) -> dict:
             }
         )
         merged_files += kept
-        print(
-            f'[{dir_}] module={data.get("go_module") or "?"} killed={c["killed"]} lived={c["lived"]} '
-            f'not_covered={c["not_covered"]} not_viable={c["not_viable"]} timed_out={c["timed_out"]} '
-            f'efficacy={efficacy(c):.1f}% coverage={mutant_coverage(c):.1f}% '
-            f'dropped_nested={dropped} mode={per_module[-1]["mode"]}',
+        workflow_commands.say(
+            t'[{dir_}] module={data.get("go_module") or "?"} killed={c["killed"]} lived={c["lived"]} '
+            t'not_covered={c["not_covered"]} not_viable={c["not_viable"]} timed_out={c["timed_out"]} '
+            t'efficacy={efficacy(c):.1f}% coverage={mutant_coverage(c):.1f}% '
+            t'dropped_nested={dropped} mode={per_module[-1]["mode"]}',
             file=sys.stderr,
         )
 
     if problems:
         for p in problems:
-            print(f'::error::gremlins-merge: {p}', file=sys.stderr)
+            print(workflow_commands.command('error', f'gremlins-merge: {p}'), file=sys.stderr)
         raise SystemExit(
             'gremlins-merge: refusing to publish a number derived from results that '
             'do not add up (see errors above)'
@@ -433,14 +437,14 @@ def main() -> int:
     merged = merge(modules, skipped)
     args.out.write_text(json.dumps(merged))
     c = merged
-    print(
-        f'[merged] modules={len(modules)} killed={c["mutants_killed"]} lived={c["mutants_lived"]} '
-        f'not_covered={c["mutants_not_covered"]} efficacy={c["test_efficacy"]:.1f}% '
-        f'coverage={c["mutations_coverage"]:.1f}% -> {args.out}',
+    workflow_commands.say(
+        t'[merged] modules={len(modules)} killed={c["mutants_killed"]} lived={c["mutants_lived"]} '
+        t'not_covered={c["mutants_not_covered"]} efficacy={c["test_efficacy"]:.1f}% '
+        t'coverage={c["mutations_coverage"]:.1f}% -> {args.out}',
         file=sys.stderr,
     )
     return 0
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(workflow_commands.run_main(main))

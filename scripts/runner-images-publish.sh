@@ -6,6 +6,8 @@
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$TOOLS/gha-log.sh"
 # shellcheck source=SCRIPTDIR/retry.sh
 . "$TOOLS/retry.sh"
 
@@ -14,7 +16,7 @@ MODE=${1:?$USAGE}
 : "${PLAN:?PLAN is required}" "${PACKAGE:?PACKAGE is required}"
 
 fail() {
-  echo "::error::$*" >&2
+  gha_annotate error '%s' "$*" >&2
   exit 1
 }
 entry_of() { # <image> -> its plan entry

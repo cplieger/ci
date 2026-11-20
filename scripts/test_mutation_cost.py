@@ -19,6 +19,7 @@ SCRIPTS = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
 import mutation_cost  # noqa: E402
+import workflow_commands  # noqa: E402
 
 
 class Attribute(unittest.TestCase):
@@ -380,7 +381,7 @@ class Bound(unittest.TestCase):
         note = mutation_cost.deadline_note('r:web', {'deadline': ['a.ts:1-9', 'b.ts']})
         self.assertIn(
             'r:web: unmeasured, running alone under the deadline: a.ts:1-9, b.ts',
-            mutation_cost.render(note),
+            workflow_commands.render(note),
         )
         for plan in ({'deadline': []}, {}, None, {'deadline': [1]}):
             self.assertIsNone(mutation_cost.deadline_note('r', plan))
@@ -667,7 +668,7 @@ class PriorError(unittest.TestCase):
                 self.subTest(measured=measured),
                 unittest.mock.patch.object(mutation_cost, 'annotate') as annotate,
                 unittest.mock.patch.object(mutation_cost, 'summarize') as summarize,
-                unittest.mock.patch.object(mutation_cost, 'say'),
+                unittest.mock.patch.object(workflow_commands, 'say'),
             ):
                 mutation_cost.note_prior_error('r', measured)
                 self.assertEqual(annotate.called, warned)

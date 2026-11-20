@@ -7,6 +7,9 @@
 # for the action's cache.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/../../scripts/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/../../scripts/gha-log.sh"
+
 [ "$#" -eq 1 ] || {
   echo "usage: install.sh <dest-dir> | --key" >&2
   exit 2
@@ -75,7 +78,7 @@ case "$(uname -m)" in
   x86_64 | amd64) arch=amd64 cue_sha=$CUE_SHA256_AMD64 go_sha=$GO_SHA256_AMD64 ;;
   aarch64 | arm64) arch=arm64 cue_sha=$CUE_SHA256_ARM64 go_sha=$GO_SHA256_ARM64 ;;
   *)
-    echo "::error::dashboard-check: no cue or Go build pinned for $(uname -m)" >&2
+    gha_annotate error 'dashboard-check: no cue or Go build pinned for %s' "$(uname -m)" >&2
     exit 1
     ;;
 esac
@@ -137,4 +140,4 @@ if [ ! -x "$DEST/promql-check" ] || [ "$(cat "$DEST/promql-check.stamp" 2>/dev/n
   echo "$stamp" >"$DEST/promql-check.stamp"
 fi
 
-echo "dashboard-check: cue ${CUE_VERSION}, ${#SCHEMAS[@]} Grafana schema(s) and promql-check (built with ${GO_VERSION}) in ${DEST}"
+gha_say 'dashboard-check: cue %s, %s Grafana schema(s) and promql-check (built with %s) in %s' "${CUE_VERSION}" "${#SCHEMAS[@]}" "${GO_VERSION}" "${DEST}"

@@ -20,6 +20,7 @@ from pathlib import Path
 
 import fanout
 import ghrest
+import workflow_commands
 import yaml
 
 OWNER = 'cplieger'
@@ -189,7 +190,11 @@ def add_label(repo, number):
         if REST.get_or_none(f'repos/{repo}/labels/{PR_LABEL}') is not None:
             REST.send('POST', f'repos/{repo}/issues/{number}/labels', {'labels': [PR_LABEL]})
     except ghrest.ApiError as err:
-        print(f'::warning::{repo}#{number}: label {PR_LABEL} was not applied: {err}')
+        print(
+            workflow_commands.command(
+                'warning', f'{repo}#{number}: label {PR_LABEL} was not applied: {err}'
+            )
+        )
 
 
 def ensure_pr(repo, base, into, changed):
@@ -215,7 +220,7 @@ def ensure_pr(repo, base, into, changed):
         {'title': PR_TITLE, 'head': branch_for(base), 'base': into, 'body': '\n'.join(body_lines)},
     )
     add_label(repo, pr['number'])
-    print(f'  opened PR: {pr["html_url"]}')
+    workflow_commands.say(t'  opened PR: {pr["html_url"]}')
 
 
 def close_stale_pr(repo, base, row):
@@ -234,7 +239,11 @@ def close_stale_pr(repo, base, row):
         except ghrest.ApiError as err:
             # 422 is GitHub's answer for a ref that no longer exists.
             if what != 'branch delete' or err.status != 422:
-                print(f'::warning::{label}: stale sync PR #{number}: {what} failed: {err}')
+                print(
+                    workflow_commands.command(
+                        'warning', f'{label}: stale sync PR #{number}: {what} failed: {err}'
+                    )
+                )
     print(f'  closed stale sync PR #{number}')
 
 
@@ -256,14 +265,17 @@ def sync_repo(repo, base, dest_map, source_root, dry_run):
                     row = open_pull(repo, base)
                 except ghrest.ApiError as err:
                     print(
-                        f'::warning::{target_label(repo, base)}: the open sync PR lookup failed: {err}'
+                        workflow_commands.command(
+                            'warning',
+                            f'{target_label(repo, base)}: the open sync PR lookup failed: {err}',
+                        )
                     )
                     return 'clean'
                 if row is not None:
                     close_stale_pr(repo, base, row)
             return 'clean'
 
-        print(f'  {len(changed)} file(s) differ: {", ".join(changed)}')
+        workflow_commands.say(t'  {len(changed)} file(s) differ: {", ".join(changed)}')
         if dry_run:
             return 'dry'
 
@@ -280,7 +292,7 @@ def sync_target(target, dest_map, source_root, dry_run):
     """sync_repo inside the target's log group; None when the target failed."""
     repo, base = target
     label = target_label(repo, base)
-    print(f'::group::{label}')
+    print(workflow_commands.command('group', label))
     try:
         return sync_repo(repo, base, dest_map, source_root, dry_run)
     except (subprocess.CalledProcessError, ghrest.ApiError, OSError) as exc:
@@ -289,10 +301,10 @@ def sync_target(target, dest_map, source_root, dry_run):
             if isinstance(exc, subprocess.CalledProcessError) and exc.stderr
             else str(exc)
         )
-        print(f'::warning::{label}: sync failed — {detail}')
+        print(workflow_commands.command('warning', f'{label}: sync failed — {detail}'))
         return None
     finally:
-        print('::endgroup::')
+        print(workflow_commands.command('endgroup'))
 
 
 def fork_names():
@@ -324,7 +336,11 @@ def drop_forks(mapping):
     for target, dest_map in mapping.items():
         full_name = target[0]
         if full_name.split('/')[-1] in forks:
-            print(f'::notice::{target_label(*target)}: skipped, repo is a fork')
+            print(
+                workflow_commands.command(
+                    'notice', f'{target_label(*target)}: skipped, repo is a fork'
+                )
+            )
             continue
         kept[target] = dest_map
     return kept
@@ -336,7 +352,11 @@ def sweep_lookup(target):
     try:
         return open_pulls(repo, base)
     except ghrest.ApiError as err:
-        print(f'::warning::{target_label(repo, base)}: the open sync PR lookup failed: {err}')
+        print(
+            workflow_commands.command(
+                'warning', f'{target_label(repo, base)}: the open sync PR lookup failed: {err}'
+            )
+        )
         return []
 
 
@@ -347,7 +367,9 @@ def delete_merged_head(repo, number):
         REST.send('DELETE', f'repos/{repo}/git/refs/heads/{BRANCH}')
     except ghrest.ApiError as err:
         if err.status != 422:
-            print(f'  WARN: merged {repo}#{number} but could not delete {BRANCH}: {err}')
+            workflow_commands.say(
+                t'  WARN: merged {repo}#{number} but could not delete {BRANCH}: {err}'
+            )
 
 
 def merged(repo, number):
@@ -368,24 +390,30 @@ def arm_default(repo, number):
     try:
         auto = RUN(args)
     except (ghrest.ApiError, OSError) as err:
-        print(f'  WARN: failed to merge {repo}#{number}: auto-merge did not run ({err})')
+        workflow_commands.say(
+            t'  WARN: failed to merge {repo}#{number}: auto-merge did not run ({err})'
+        )
         return
     if auto.returncode == 0:
-        print(f'{repo}#{number}: armed')
+        workflow_commands.say(t'{repo}#{number}: armed')
         return
     refused = ' '.join(auto.stderr.decode(errors='replace').split()) or f'exit {auto.returncode}'
     if ghrest.refused_by_rate_limit(auto):
         if merged(repo, number):
-            print(f'{repo}#{number}: merged')
+            workflow_commands.say(t'{repo}#{number}: merged')
             return
-        print(f'  WARN: failed to merge {repo}#{number}: auto-merge rate limited ({refused})')
+        workflow_commands.say(
+            t'  WARN: failed to merge {repo}#{number}: auto-merge rate limited ({refused})'
+        )
         return
     try:
         REST.send('PUT', f'repos/{repo}/pulls/{number}/merge', {'merge_method': 'squash'})
     except ghrest.ApiError as err:
-        print(f'  WARN: failed to merge {repo}#{number}: auto-merge refused ({refused}) and {err}')
+        workflow_commands.say(
+            t'  WARN: failed to merge {repo}#{number}: auto-merge refused ({refused}) and {err}'
+        )
         return
-    print(f'{repo}#{number}: merged')
+    workflow_commands.say(t'{repo}#{number}: merged')
     delete_merged_head(repo, number)
 
 
@@ -393,7 +421,7 @@ def arm(pr, merge_checked):
     """Arm or merge one open sync PR; False only when a `base: main` target's PR was
     left open (a main-default or `dev` refusal is a warning)."""
     repo, base, number = pr
-    print(f'Enabling auto-merge on {repo}#{number}')
+    workflow_commands.say(t'Enabling auto-merge on {repo}#{number}')
     if base is None:
         arm_default(repo, number)
         return True
@@ -404,7 +432,7 @@ def arm(pr, merge_checked):
     if merge_checked(name, number, base=base, head=head):
         return True
     if base == 'dev':
-        print(f'  WARN: failed to merge {repo}#{number}')
+        workflow_commands.say(t'  WARN: failed to merge {repo}#{number}')
         return True
     return False
 
@@ -434,7 +462,11 @@ def arm_open_prs(mapping, workers):
         if not ok
     ]
     if left_open:
-        print('::error::a sync pull request into main was left open, as the lines above show')
+        print(
+            workflow_commands.command(
+                'error', 'a sync pull request into main was left open, as the lines above show'
+            )
+        )
         return 1
     return 0
 
@@ -476,7 +508,7 @@ def main():
     try:
         mapping = load_mapping(args.manifest)
     except ManifestError as err:
-        sys.exit(f'::error::sync-files: {err}')
+        sys.exit(workflow_commands.command('error', f'sync-files: {err}'))
     if args.only:
         wanted = {w.strip() for w in args.only.replace(',', ' ').split() if w.strip()}
         mapping = {t: f for t, f in mapping.items() if t[0].split('/')[-1] in wanted}
@@ -506,10 +538,12 @@ def main():
 
     total = len(mapping)
     noun = 'repo(s)' if all(base is None for _repo, base in mapping) else 'target(s)'
-    print(
-        f'\n{total} {noun}: {counts["changed"]} synced · '
-        f'{counts["clean"]} already in sync · {counts["dry"]} with pending diffs (dry-run) · '
-        f'{len(failures)} failed{" (" + ", ".join(failures) + ")" if failures else ""}'
+    failed = t' ({", ".join(failures)})' if failures else t''
+    print()
+    workflow_commands.say(
+        t'{total} {noun}: {counts["changed"]} synced · '
+        t'{counts["clean"]} already in sync · {counts["dry"]} with pending diffs (dry-run) · '
+        t'{len(failures)} failed{failed}'
     )
     if failures:
         sys.exit(1)

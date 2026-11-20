@@ -63,6 +63,7 @@ class PublishGate(unittest.TestCase):
         tools.mkdir()
         (tools / 'retry.sh').write_text('retry() { "$@"; }\n')
         shutil.copy(ROOT / 'scripts' / 'dashboards.sh', tools / 'dashboards.sh')
+        shutil.copy(ROOT / 'scripts' / 'gha-log.sh', tools / 'gha-log.sh')
         work = tmp / 'work'
         work.mkdir()
         for name, content in files.items():

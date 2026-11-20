@@ -6,6 +6,9 @@
 # publish. A `"private": true` package is a dry run on both, checking neither.
 # OIDC only: trusted publishers at npmjs.com and jsr.io.
 set -euo pipefail
+
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
 : "${VERSION:?}" "${CHANNEL:?}"
 
 ver="${VERSION##*/}"
@@ -20,10 +23,10 @@ fi
 DRY_RUN=()
 if [ "$(jq -r '.private // false' package.json)" = true ]; then
   DRY_RUN=(--dry-run)
-  echo "::notice::$pkg is private, so its publish is a dry run"
+  gha_annotate notice '%s is private, so its publish is a dry run' "$pkg"
   npm publish --dry-run --access public "${NPM_TAG_ARGS[@]}"
 elif npm view "$pkg@$ver" version >/dev/null 2>&1; then
-  echo "::notice::npm: $pkg@$ver already published — skipping"
+  gha_annotate notice 'npm: %s@%s is already published, so it is skipped' "$pkg" "$ver"
 else
   npm publish --access public "${NPM_TAG_ARGS[@]}"
 fi
@@ -34,7 +37,7 @@ fi
 : "${JSR_VERSION:?}"
 if [ "${#DRY_RUN[@]}" -eq 0 ] && curl -fsSL "https://jsr.io/${pkg}/meta.json" \
   | jq -e --arg v "$ver" '.versions[$v]' >/dev/null 2>&1; then
-  echo "::notice::jsr: $pkg@$ver already published — skipping"
+  gha_annotate notice 'jsr: %s@%s is already published, so it is skipped' "$pkg" "$ver"
 else
   # deno's `jsr publish` uses BYONM, so runtime dependencies (e.g.
   # @cplieger/actions -> @cplieger/reactive) must already be in node_modules,

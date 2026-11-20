@@ -1,11 +1,11 @@
 # Opens or updates one pull request per repository in REPOS
-# (scripts/community_data_refresh.py; langtag's CLDR tables) from the proposal
-# its own community-data-refresh.yaml uploaded. That workflow runs the
-# repository's refresh on its base branch with no secret; this one runs none of
-# the repository's code and reads the artifact only as data, checked against
-# the row's allowed paths. The pull request waits for its ci / validate and a
-# human merge. The proposal format is in docs/workflows.md; sync.yaml
-# documents the App's secrets.
+# (scripts/community_data_refresh.py) from the proposal its own
+# community-data-refresh.yaml uploaded, and keeps its community-data issues in
+# step with the proposal's notices. That workflow runs the refresh on the base
+# branch with no secret; this one runs none of the repository's code and reads
+# the artifact only as data, checked against the row. The pull request waits
+# for its ci / validate and a human merge. docs/workflows.md has the proposal
+# format and the issue rules; sync.yaml documents the App's secrets.
 name: Community data refresh
 
 on:
@@ -75,7 +75,8 @@ jobs:
         with:
           python-version: "3.15"
 
-      # Another repository's artifacts need a token holding actions: read on it.
+      # Another repository's artifacts need actions: read on it, and check reads
+      # its community-data issues.
       - name: Mint the read token
         id: read-token
         uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
@@ -85,6 +86,7 @@ jobs:
           owner: cplieger
           repositories: ${{ matrix.repo }}
           permission-actions: read
+          permission-issues: read
 
       - name: Find the refresh run
         id: run
@@ -107,15 +109,18 @@ jobs:
       - name: Check the proposal
         id: check
         env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
           REPO: ${{ matrix.repo }}
           PROPOSAL: ${{ runner.temp }}/proposal
+          PLAN: ${{ runner.temp }}/issues.json
         run: |
           set -euo pipefail
-          python3 scripts/community_data_refresh.py check --repo "$REPO" --proposal "$PROPOSAL"
+          python3 scripts/community_data_refresh.py check --repo "$REPO" --proposal "$PROPOSAL" --plan "$PLAN"
 
-      # The App token: a pull request the workflow token opens starts no CI run.
+      # The App token: a pull request the workflow token opens starts no CI run,
+      # and the workflow token cannot write to another repository's issues.
       - name: Mint the App token
-        if: steps.check.outputs.changed == 'true'
+        if: steps.check.outputs.changed == 'true' || steps.check.outputs.notices_changed == 'true'
         id: app-token
         uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
@@ -124,10 +129,21 @@ jobs:
           owner: cplieger
           repositories: ${{ matrix.repo }}
           permission-contents: write
+          permission-issues: write
           permission-pull-requests: write
 
+      - name: Write the notices' issues
+        if: ${{ !cancelled() && steps.app-token.outcome == 'success' && steps.check.outputs.notices_changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ matrix.repo }}
+          PLAN: ${{ runner.temp }}/issues.json
+        run: |
+          set -euo pipefail
+          python3 scripts/community_data_refresh.py issues --repo "$REPO" --plan "$PLAN"
+
       - name: Propose cplieger/${{ matrix.repo }}'s refresh
-        if: steps.check.outputs.changed == 'true'
+        if: ${{ !cancelled() && steps.app-token.outcome == 'success' && steps.check.outputs.changed == 'true' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}

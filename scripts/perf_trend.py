@@ -25,6 +25,7 @@ from urllib.parse import quote
 
 import ghrest
 import perf_gate
+import workflow_commands
 
 SCHEMA = 1
 STAMP = '%Y%m%dT%H%M%SZ'
@@ -1139,7 +1140,7 @@ def run(a: argparse.Namespace) -> int:
             run_url=a.run_url,
         )
         pathlib.Path(a.out).write_text(dumps(made))
-        print(f'{a.out}: {len(made["cells"])} cells from {made["runs"]} runs')
+        workflow_commands.say(t'{a.out}: {len(made["cells"])} cells from {made["runs"]} runs')
     elif a.command == 'skip':
         path = pathlib.Path(a.state)
         state = perf_gate.load(path) if path.is_file() else new_state('')
@@ -1168,18 +1169,18 @@ def run(a: argparse.Namespace) -> int:
         )
         summary += seconds_drift(plan_doc, p)
         pathlib.Path(a.actions).write_text(json.dumps(actions, indent=1) + '\n')
-        print(summary)
+        workflow_commands.say_lines(summary)
         if a.summary:
             with pathlib.Path(a.summary).open('a') as f:
                 f.write(summary)
     elif a.command == 'fetch-issues':
         issues = fetch_issues(a.repo)
         pathlib.Path(a.out).write_text(json.dumps(issues, indent=1) + '\n')
-        print(f'{a.out}: {len(issues)} issues labelled {LABEL}')
+        workflow_commands.say(t'{a.out}: {len(issues)} issues labelled {LABEL}')
     else:
         actions = json.loads(pathlib.Path(a.actions).read_text())
         for line in apply(actions, a.repo):
-            print(line)
+            workflow_commands.say(t'{line}')
     return 0
 
 
@@ -1188,7 +1189,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return run(a)
     except (OSError, ValueError, KeyError, TypeError, ghrest.ApiError) as exc:
-        print(f'::error::perf_trend: {exc}', file=sys.stderr)
+        print(workflow_commands.command('error', f'perf_trend: {exc}'), file=sys.stderr)
         return 1
 
 

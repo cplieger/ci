@@ -4,6 +4,9 @@
 # A binary already installed at that version is kept, so a rerun downloads nothing.
 set -euo pipefail
 
+# shellcheck source=SCRIPTDIR/../../scripts/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/../../scripts/gha-log.sh"
+
 usage() {
   echo "usage: install.sh promtool|lokitool <version> <dest-dir>" >&2
   exit 2
@@ -20,7 +23,7 @@ case "$(uname -m)" in
   x86_64 | amd64) arch=amd64 ;;
   aarch64 | arm64) arch=arm64 ;;
   *)
-    echo "::error::alert-rules: no $tool build for $(uname -m)" >&2
+    gha_annotate error 'alert-rules: no %s build for %s' "$tool" "$(uname -m)" >&2
     exit 1
     ;;
 esac

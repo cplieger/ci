@@ -11,7 +11,9 @@ that path to --actions-root, the ci source under test. A local action
 (`./<path>`) runs from --cwd, and a `cplieger/ci/actions/<name>@<ref>` one from
 --actions-root, which replays an older revision's workflow. Any other action
 fails unless --skip names its step. Writes the job's and steps' outputs and
-every expression evaluated to --out; exits 1 naming the step that failed.
+every expression evaluated to --out. A failed step fails the job as on
+GitHub: later steps run only when their `if:` allows it, then the replay exits
+1 naming the first step that failed.
 Stdlib plus PyYAML.
 """
 
@@ -46,6 +48,11 @@ TOKEN = re.compile(
 
 class ReplayError(Exception):
     pass
+
+
+class StepFailedError(ReplayError):
+    """A step's command exited non-zero: the job goes on to the steps whose
+    `if:` runs them after a failure, then fails naming the first."""
 
 
 # ── Expressions ───────────────────────────────────────────────────────────────
@@ -284,13 +291,17 @@ class Scope:
         return EXPR.sub(lambda m: to_str(self.evaluate(m.group(1))), value)
 
     def condition(self, cond) -> bool:
+        """A step's `if:`; one with no status function is `success() && (...)`."""
         if cond is None:
             return not self.status.get('failed')
         if isinstance(cond, bool):
             return cond
         text = str(cond).strip()
         whole = WHOLE_EXPR.fullmatch(text)
-        return truthy(self.evaluate(whole.group(1) if whole else text))
+        text = (whole.group(1) if whole else text).strip()
+        if not STATUS_CALL.search(text):
+            text = f'success() && ({text})'
+        return truthy(self.evaluate(text))
 
 
 class JobScope(Scope):
@@ -422,7 +433,7 @@ class Job:
         (self.temp / f'log-{len(self.ran)}.txt').write_text(proc.stdout + proc.stderr)
         self.ran.append(name)
         if proc.returncode != 0:
-            raise ReplayError(
+            raise StepFailedError(
                 f'step {name!r} exited {proc.returncode}:\n{(proc.stdout + proc.stderr)[-3000:]}'
             )
         self.base_env.update(read_kv_file(env_file))
@@ -530,33 +541,50 @@ class Job:
                 self.ran.append(f'{name} (if false)')
                 continue
             require_replayable(name, step)
-            env = {**job_env, **{k: scope.render(v) for k, v in (step.get('env') or {}).items()}}
-            uses = step.get('uses', '')
-            if 'run' in step:
-                workdir = scope.render(step.get('working-directory', ''))
-                outs = self.run_bash(name, scope.render(step['run']), env, workdir)
-            elif uses.startswith(CHECKOUT):
-                self.checkout(name, step.get('with') or {}, scope)
-                outs = {}
-            elif uses.startswith(SETUP_PYTHON):
-                # The replay runs its steps on this interpreter, already at the floor.
-                self.ran.append(name)
-                outs = {}
-            elif LOCAL_ACTION.match(uses) or OWN_ACTION.match(uses):
-                local = LOCAL_ACTION.match(uses)
-                path = (
-                    self.cwd / local.group(1)
-                    if local
-                    else self.actions_root / 'actions' / OWN_ACTION.match(uses).group(1)
-                )
-                outs = self.composite(name, path, step.get('with') or {}, scope, env)
-                self.ran.append(name)
-            else:
-                raise ReplayError(f'step {name!r} uses {uses!r}. Pass --skip to replay without it.')
+            try:
+                outs = self.step(name, step, job_env, scope)
+            except StepFailedError as exc:
+                status.setdefault('failed', str(exc))
+                contexts['job']['status'] = 'failure'
+                if step.get('id'):
+                    steps[step['id']] = {
+                        'outputs': {},
+                        'outcome': 'failure',
+                        'conclusion': 'failure',
+                    }
+                continue
             if step.get('id'):
                 steps[step['id']] = {'outputs': outs, 'outcome': 'success', 'conclusion': 'success'}
+        if status.get('failed'):
+            raise ReplayError(status['failed'])
         result['outputs'] = {k: scope.render(v) for k, v in (job.get('outputs') or {}).items()}
         return result
+
+    def step(self, name: str, step: dict, job_env: dict, scope: Scope) -> dict:
+        """Run one job step; its outputs."""
+        env = {**job_env, **{k: scope.render(v) for k, v in (step.get('env') or {}).items()}}
+        uses = step.get('uses', '')
+        if 'run' in step:
+            workdir = scope.render(step.get('working-directory', ''))
+            return self.run_bash(name, scope.render(step['run']), env, workdir)
+        if uses.startswith(CHECKOUT):
+            self.checkout(name, step.get('with') or {}, scope)
+            return {}
+        if uses.startswith(SETUP_PYTHON):
+            # The replay runs its steps on this interpreter, already at the floor.
+            self.ran.append(name)
+            return {}
+        if LOCAL_ACTION.match(uses) or OWN_ACTION.match(uses):
+            local = LOCAL_ACTION.match(uses)
+            path = (
+                self.cwd / local.group(1)
+                if local
+                else self.actions_root / 'actions' / OWN_ACTION.match(uses).group(1)
+            )
+            outs = self.composite(name, path, step.get('with') or {}, scope, env)
+            self.ran.append(name)
+            return outs
+        raise ReplayError(f'step {name!r} uses {uses!r}. Pass --skip to replay without it.')
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -54,6 +54,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import ghrest
+import workflow_commands
 
 ALWAYS_LABEL = 'auto-generated'
 # (color, description) per label this transport creates. Unknown labels get
@@ -95,8 +96,8 @@ def issues_enabled(repo: str) -> bool:
     try:
         data = ghrest.get(f'repos/{repo}')
     except ghrest.ApiError as err:
-        print(
-            f'could not read the issue setting for {repo}; attempting the issue ops anyway: {err}',
+        workflow_commands.say(
+            t'could not read the issue setting for {repo}, so the issue ops run anyway: {err}',
             file=sys.stderr,
         )
         return True
@@ -158,7 +159,7 @@ def ensure_label(repo: str, name: str) -> None:
         )
     except ghrest.ApiError as err:
         if not (err.status == 422 and 'already_exists' in str(err)):
-            print(f'label {name!r} not created in {repo}: {err}', file=sys.stderr)
+            workflow_commands.say(t'label {name!r} not created in {repo}: {err}', file=sys.stderr)
 
 
 def create(repo: str, title: str, labels: list[str], body_file: Path, assignee: str = '') -> int:
@@ -170,7 +171,7 @@ def create(repo: str, title: str, labels: list[str], body_file: Path, assignee: 
         payload['assignees'] = [assignee]
     issue = api('POST', f'repos/{repo}/issues', payload)
     number = issue['number']
-    print(f'created #{number} in {repo}: {title}')
+    workflow_commands.say(t'created #{number} in {repo}: {title}')
     return number
 
 
@@ -184,19 +185,23 @@ def ensure_assignee(repo: str, issue: dict, assignee: str) -> None:
             'POST', f'repos/{repo}/issues/{issue["number"]}/assignees', {'assignees': [assignee]}
         )
     except ghrest.ApiError as err:
-        print(f'::warning::{repo}#{issue["number"]}: could not assign {assignee}: {err}')
+        print(
+            workflow_commands.command(
+                'warning', f'{repo}#{issue["number"]}: could not assign {assignee}: {err}'
+            )
+        )
         return
-    print(f'assigned {assignee} to #{issue["number"]}')
+    workflow_commands.say(t'assigned {assignee} to #{issue["number"]}')
 
 
 def set_flag(repo: str, number: int, current: set[str], flag_label: str, flag: str) -> None:
     if flag == 'on' and flag_label not in current:
         ensure_label(repo, flag_label)
         api('POST', f'repos/{repo}/issues/{number}/labels', {'labels': [flag_label]})
-        print(f'flagged #{number} {flag_label}')
+        workflow_commands.say(t'flagged #{number} {flag_label}')
     elif flag == 'off' and flag_label in current:
         api('DELETE', f'repos/{repo}/issues/{number}/labels/{quote(flag_label, safe="")}')
-        print(f'unflagged #{number} {flag_label}')
+        workflow_commands.say(t'unflagged #{number} {flag_label}')
 
 
 def create_labels(args: argparse.Namespace) -> list[str]:
@@ -213,7 +218,11 @@ def mode_fetch(args: argparse.Namespace) -> int:
         args.title_file.write_text((issue.get('title') or '') if issue else '')
     print(f'fetched #{issue["number"]}' if issue else 'no open issue to fetch')
     for dup in duplicates:
-        print(f'::warning::{args.repo}#{dup["number"]} duplicates #{issue["number"]}')
+        print(
+            workflow_commands.command(
+                'warning', f'{args.repo}#{dup["number"]} duplicates #{issue["number"]}'
+            )
+        )
     return 0
 
 
@@ -228,9 +237,9 @@ def mode_upsert(args: argparse.Namespace) -> int:
             edit['title'] = args.title
         if edit:
             api('PATCH', f'repos/{args.repo}/issues/{number}', edit)
-            print(f'updated #{number} in {args.repo}')
+            workflow_commands.say(t'updated #{number} in {args.repo}')
         else:
-            print(f'unchanged #{number} in {args.repo}')
+            workflow_commands.say(t'unchanged #{number} in {args.repo}')
         ensure_assignee(args.repo, issue, args.assignee)
     else:
         labels = create_labels(args)
@@ -238,7 +247,7 @@ def mode_upsert(args: argparse.Namespace) -> int:
         current = set(labels)
     for dup in duplicates:
         close_issue(args.repo, dup['number'], f'Duplicate of #{number}.\n', 'duplicate')
-        print(f'closed #{dup["number"]} in {args.repo} as a duplicate of #{number}')
+        workflow_commands.say(t'closed #{dup["number"]} in {args.repo} as a duplicate of #{number}')
     if args.flag_label:
         set_flag(args.repo, number, current, args.flag_label, args.flag)
     return 0
@@ -253,7 +262,7 @@ def mode_recur(args: argparse.Namespace) -> int:
             f'repos/{args.repo}/issues/{number}/comments',
             {'body': args.comment_file.read_text()},
         )
-        print(f'commented on #{number} in {args.repo}')
+        workflow_commands.say(t'commented on #{number} in {args.repo}')
         ensure_assignee(args.repo, issue, args.assignee)
     else:
         labels = create_labels(args)
@@ -267,11 +276,11 @@ def mode_recur(args: argparse.Namespace) -> int:
 def mode_close_when_clean(args: argparse.Namespace) -> int:
     issue, duplicates = find_issue(args)
     if not issue:
-        print(f'no open issue to close in {args.repo}: {args.title or args.label}')
+        workflow_commands.say(t'no open issue to close in {args.repo}: {args.title or args.label}')
         return 0
     for each in (issue, *duplicates):
         close_issue(args.repo, each['number'], args.comment_file.read_text(), 'completed')
-        print(f'closed #{each["number"]} in {args.repo}')
+        workflow_commands.say(t'closed #{each["number"]} in {args.repo}')
     return 0
 
 
@@ -362,7 +371,9 @@ def main(argv: list[str] | None = None, *, allow_reserved: bool = False) -> int:
     if not issues_enabled(args.repo):
         subject = args.title or args.label
         print(
-            f'::notice::{args.repo} has issues disabled; skipped {args.mode} for {subject}',
+            workflow_commands.command(
+                'notice', f'{args.repo} has issues disabled; skipped {args.mode} for {subject}'
+            ),
             file=sys.stderr,
         )
         if args.mode == 'fetch':
@@ -373,7 +384,7 @@ def main(argv: list[str] | None = None, *, allow_reserved: bool = False) -> int:
     try:
         return MODES[args.mode](args)
     except GhError as err:
-        print(f'::error::{args.repo}: {err}', file=sys.stderr)
+        print(workflow_commands.command('error', f'{args.repo}: {err}'), file=sys.stderr)
         return 1
 
 

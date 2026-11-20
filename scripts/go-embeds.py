@@ -23,11 +23,15 @@ import subprocess
 import sys
 import tomllib
 
+import workflow_commands
+
 
 def git(*args: str) -> str:
     proc = subprocess.run(['git', *args], capture_output=True, text=True, check=False)
     if proc.returncode != 0:
-        sys.stderr.write(f'go-embeds: git {" ".join(args)} failed: {proc.stderr.strip()}\n')
+        workflow_commands.say(
+            t'go-embeds: git {" ".join(args)} failed: {proc.stderr.strip()}', file=sys.stderr
+        )
         sys.exit(2)
     return proc.stdout
 
@@ -217,7 +221,7 @@ def directives_at(commit: str) -> tuple[frozenset[str], dict[str, list[str]]]:
         check=False,
     )
     if proc.returncode > 1:
-        sys.stderr.write(f'go-embeds: git grep failed: {proc.stderr.strip()}\n')
+        workflow_commands.say(t'go-embeds: git grep failed: {proc.stderr.strip()}', file=sys.stderr)
         sys.exit(2)
     lines = []
     ignored = set()
@@ -275,7 +279,7 @@ def with_commits(args: list[str]) -> int:
     for flag in rest:
         value = next(rest, None)
         if flag not in ('--owned', '--skips', '--config', '--positions') or value is None:
-            sys.stderr.write(f'go-embeds: unexpected argument {flag!r}\n')
+            workflow_commands.say(t'go-embeds: unexpected argument {flag!r}', file=sys.stderr)
             return 2
         if flag == '--owned':
             owned_file = value

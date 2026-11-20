@@ -123,18 +123,20 @@ jobs:
 
       - name: Measure
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           CELLS: ${{ inputs.cells }}
           PERF_BUILD: ${{ runner.temp }}/perf-build
           RUNNER_LABEL: ${{ inputs.runner || 'ubuntu-26.04' }}
           ARTIFACT: perf-results-${{ inputs.name }}-attempt-${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           out="$RUNNER_TEMP/perf-results"
           mkdir -p "$out"
           printf '%s\n' "$CELLS" > "$RUNNER_TEMP/cells.json"
           tests/perf/run.sh "$RUNNER_TEMP/cells.json" "$out"
           if [ ! -s "$out/results.json" ]; then
-            echo "::error::tests/perf/run.sh wrote no ${out}/results.json"
+            gha_annotate error 'tests/perf/run.sh wrote no %s/results.json' "${out}"
             exit 1
           fi
           # perf_gate.py and perf_trend.py judge results only against baselines of

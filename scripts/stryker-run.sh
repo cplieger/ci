@@ -9,17 +9,20 @@
 # 137 when Stryker was then killed, else Stryker's status.
 set -uo pipefail
 
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
+
 : "${ENTRY:?}" "${REPORTER:?}" "${CI_STRYKER_PLAN:-${CI_STRYKER_TIMES:?}}"
 : "${CI_STRYKER_TIMES:+${RUN_DEADLINE:?}${CI_STRYKER_RESULT:?}}"
 case "${RUN_DEADLINE:-0}" in
   *[!0-9]*)
-    echo "::error::${ENTRY}: RUN_DEADLINE=${RUN_DEADLINE} is not an epoch second"
+    gha_annotate error '%s: RUN_DEADLINE=%s is not an epoch second' "${ENTRY}" "${RUN_DEADLINE}"
     exit 2
     ;;
 esac
 case "${KILL_GRACE:=300}" in
   *[!0-9]*)
-    echo "::error::${ENTRY}: KILL_GRACE=${KILL_GRACE} is not a number of seconds"
+    gha_annotate error '%s: KILL_GRACE=%s is not a number of seconds' "${ENTRY}" "${KILL_GRACE}"
     exit 2
     ;;
 esac
@@ -50,12 +53,12 @@ until_deadline() {
   wait "${timer}" 2>/dev/null
   if [ -e "${marks}/killed" ]; then
     rc=137
-    echo "::error::${ENTRY}: the shard reached its time budget and Stryker did not end ${grace} s after the interrupt, so it was killed"
+    gha_annotate error '%s: the shard reached its time budget and Stryker did not end %s s after the interrupt, so it was killed' "${ENTRY}" "${grace}"
   elif [ -e "${marks}/interrupted" ]; then
     rc=124
-    echo "::error::${ENTRY}: the shard reached its time budget, so it publishes nothing and records what it measured"
+    gha_annotate error '%s: the shard reached its time budget, so it publishes nothing and records what it measured' "${ENTRY}"
   elif [ "${rc}" -gt 128 ]; then
-    echo "::error::${ENTRY}: Stryker ended on signal $((rc - 128)) before the deadline"
+    gha_annotate error '%s: Stryker ended on signal %s before the deadline' "${ENTRY}" "$((rc - 128))"
   fi
   rm -rf "${marks}"
   return "${rc}"
@@ -64,7 +67,7 @@ until_deadline() {
 # A failed install must not reach the enrolment gate, which would read the
 # missing binary as an un-enrolled dir and exit green having tested nothing.
 if ! npm ci; then
-  echo "::error::${ENTRY}: npm ci failed"
+  gha_annotate error '%s: npm ci failed' "${ENTRY}"
   exit 1
 fi
 
@@ -73,7 +76,7 @@ fi
 # stages nothing, so its merge job fails and with it the call.
 if ! npx --no-install stryker --version >/dev/null 2>&1; then
   msg="${ENTRY}: stryker.config.* present but @stryker-mutator/core is not a devDependency, so it is not enrolled and its call fails."
-  echo "::notice::${msg} Enroll: npm i -D @stryker-mutator/core @stryker-mutator/vitest-runner"
+  gha_annotate notice '%s Enroll: npm i -D @stryker-mutator/core @stryker-mutator/vitest-runner' "${msg}"
   exit 3
 fi
 
@@ -84,7 +87,7 @@ fi
 # engine.
 if node -e "const d=require('./package.json').devDependencies||{}; process.exit(d['@vitest/browser-playwright']?0:1)"; then
   if ! npx --no-install playwright install chromium; then
-    echo "::error::${ENTRY}: playwright chromium install failed"
+    gha_annotate error '%s: playwright chromium install failed' "${ENTRY}"
     exit 1
   fi
 fi
@@ -104,7 +107,7 @@ limit=(nice -n 10)
 if [ -n "${CI_STRYKER_TIMES:-}" ]; then
   left=$((RUN_DEADLINE - $(date +%s)))
   if [ "${left}" -le 0 ]; then
-    echo "::error::${ENTRY}: the steps before Stryker used the shard's whole budget, so it does not start"
+    gha_annotate error "%s: the steps before Stryker used the shard's whole budget, so it does not start" "${ENTRY}"
     exit 124
   fi
   limit=(until_deadline "${left}" "${KILL_GRACE}" "${limit[@]}")

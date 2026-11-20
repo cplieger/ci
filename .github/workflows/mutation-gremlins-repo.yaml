@@ -118,6 +118,7 @@ jobs:
           PLAN_TIMEOUT_MINUTES: ${{ needs.setup.outputs.plan_timeout_minutes }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
           # No module starts after this, and a module's concurrency probe, dry
           # run and timing runs end by it. The job's cap keeps 20 min for the
           # steps before this one, the last module's gremlins build, the package
@@ -130,15 +131,15 @@ jobs:
           for m in $MODULES; do
             plan_args+=(--module "${m}=plan/modules/${m}")
             if [ "$(date +%s)" -ge "${PLAN_DEADLINE}" ]; then
-              echo "::error::the plan deadline passed before ${REPO} module ${m} started"
+              gha_annotate error 'the plan deadline passed before %s module %s started' "${REPO}" "${m}"
               continue
             fi
-            echo "::group::size ${REPO} module ${m}"
+            gha_annotate group 'size %s module %s' "${REPO}" "${m}"
             rc=0
             PLAN_DIR="${PWD}/plan/modules/${m}" bash scripts/gremlins-container.sh "${m}" || rc=$?
             echo "::endgroup::"
             if [ "${rc}" -ne 0 ]; then
-              echo "::error::sizing ${REPO} module ${m} failed (exit ${rc})"
+              gha_annotate error 'sizing %s module %s failed (exit %s)' "${REPO}" "${m}" "${rc}"
             fi
           done
           python3 scripts/gremlins-shard.py plan --repo "${REPO}" --sha "${SHA}" \
@@ -298,6 +299,7 @@ jobs:
           JOB_TIMEOUT_MINUTES: ${{ needs.setup.outputs.run_timeout_minutes }}
         run: |
           set -uo pipefail
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
           # gremlins exits 0 on success regardless of efficacy (threshold=0); a
           # non-zero exit means an internal error (bad config, build failure, …).
           # Surface that as a RED cell — fail-fast is off, so one bad attempt
@@ -308,7 +310,7 @@ jobs:
             # (load_run returns None on a file with no "files" key) instead of
             # publishing a misleading 0%.
             echo '{"gremlins_error": true}' > /tmp/gremlins-out.json
-            echo "::error::$1"
+            gha_annotate error '%s' "$1"
             exit "$2"
           }
 
@@ -351,7 +353,7 @@ jobs:
           rc=0
           for i in "${!runs[@]}"; do
             m="${runs[i]}"
-            echo "::group::gremlins ${REPO} module ${m}"
+            gha_annotate group 'gremlins %s module %s' "${REPO}" "${m}"
             OUT="/work/${m}/gremlins-out.json" GREMLINS_MODE="${modes[i]}" GREMLINS_WORKERS="${workers[i]}" \
               bash scripts/gremlins-container.sh "${m}" || rc=$?
             echo "::endgroup::"
@@ -367,7 +369,7 @@ jobs:
           # module's finished files included.
           if [ "${#COST_ARGS[@]}" -eq 0 ] \
             || ! python3 scripts/gremlins-shard.py costs "${COST_ARGS[@]}" --out /tmp/gremlins-costs.json; then
-            echo "::warning::no cost record for ${REPO}, so next week prices it from its probe"
+            gha_annotate warning 'no cost record for %s, so next week prices it from its probe' "${REPO}"
           fi
 
           # Hand the result to the badge/aggregate jobs, which read /tmp.
@@ -530,11 +532,12 @@ jobs:
           REPO: ${{ inputs.repository }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
           # Target code wrote meta.json, so an artifact naming another repo is
           # warned and skipped; gremlins-aggregate.py reads only this repo's.
           found=$(bash scripts/discover-artifact-repos.sh --allow "$REPO" artifacts)
           if [ -z "$found" ]; then
-            echo "no attempt names ${REPO} this week, so its badge is left untouched"
+            gha_say 'no attempt names %s this week, so its badge is left untouched' "${REPO}"
             exit 0
           fi
           badge="$RUNNER_TEMP/mutation.json"
@@ -545,7 +548,7 @@ jobs:
           # Written only when an attempt parsed, so a repo whose every attempt
           # errored keeps its badge rather than showing 0%.
           if [ ! -s "$badge" ]; then
-            echo "no parseable attempts for ${REPO}, so its badge is left untouched"
+            gha_say 'no parseable attempts for %s, so its badge is left untouched' "${REPO}"
             exit 0
           fi
           bash actions/publish-badge/publish-badge.sh "cplieger/${REPO}" "$TOKEN" mutation.json "$(cat "$badge")"
@@ -602,10 +605,11 @@ jobs:
           REPO: ${{ inputs.repository }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/scripts/gha-log.sh"
           # The badge job's check, for the same reason.
           found=$(bash scripts/discover-artifact-repos.sh --allow "$REPO" artifacts)
           if [ -z "$found" ]; then
-            echo "no attempt names ${REPO} this week, so its tracker issue is left untouched"
+            gha_say 'no attempt names %s this week, so its tracker issue is left untouched' "${REPO}"
             exit 0
           fi
           R="cplieger/${REPO}"
@@ -619,7 +623,7 @@ jobs:
             --attempts-marker-file "$RUNNER_TEMP/attempts.txt" \
             --existing-body-file "$RUNNER_TEMP/existing.md" > "$RUNNER_TEMP/body.md"
           if [ "$(cat "$RUNNER_TEMP/attempts.txt" 2>/dev/null || echo 0)" -eq 0 ]; then
-            echo "no parseable attempts for ${REPO}, so its tracker issue is left untouched"
+            gha_say 'no parseable attempts for %s, so its tracker issue is left untouched' "${REPO}"
             exit 0
           fi
           flag=off

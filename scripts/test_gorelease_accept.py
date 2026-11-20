@@ -423,10 +423,5 @@ class SemverOrder(unittest.TestCase):
         self.assertEqual(ga.semver_key('v2.0.0+incompatible'), ga.semver_key('v2.0.0'))
 
 
-class Escape(unittest.TestCase):
-    def test_a_workflow_command_message_cannot_break_out_of_its_line(self):
-        self.assertEqual(ga.escape('100%\r\n::error::x'), '100%25%0D%0A::error::x')
-
-
 if __name__ == '__main__':
     unittest.main()

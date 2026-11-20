@@ -24,6 +24,7 @@ from pathlib import Path
 
 import inventory
 import release_channels
+import workflow_commands
 
 SCRIPTS = Path(__file__).resolve().parent
 
@@ -45,13 +46,6 @@ TITLE_TYPES = (
     'debug',
 )
 TITLE_RE = re.compile(rf'(?:{"|".join(TITLE_TYPES)})(?:\([A-Za-z0-9._/-]+\))?!?: \S.*')
-
-
-def annotate(message: str) -> str:
-    """An error workflow command whose text cannot open another command:
-    https://github.com/actions/toolkit/blob/main/packages/core/src/command.ts"""
-    data = message.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-    return f'::error::{data}'
 
 
 def check_title(title: str) -> list[str]:
@@ -269,10 +263,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             refusals = check_intake(args)
     except inventory.InventoryError as exc:
-        print(annotate(f'intake: {exc}'))
+        print(workflow_commands.command('error', f'intake: {exc}'))
         return 2
     for reason in refusals:
-        print(annotate(reason))
+        print(workflow_commands.command('error', reason))
     if refusals:
         return 1
     print(f'{args.cmd}: allowed')

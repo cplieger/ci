@@ -14,11 +14,14 @@ ROOT = Path(__file__).resolve().parent.parent
 LEGACY = ROOT / 'scripts' / 'testdata' / 'message-text' / 'legacy.txt'
 EMITTER = re.compile(
     r'::(?:error|warning|notice)[^:\n]*::'
+    r"|\bgha_annotate\s+(?:error|warning|notice)\s+(?:-p\s+\S+\s+)*[\"']"
+    r"|\bcommand\(\s*[\"'](?:error|warning|notice)[\"'],\s*f?[\"']"
     r"|\b(?:die|note|fail|warn)\s+[\"']"
     r"|\b\w*Error\((?:[\w.]+,\s*)?f?[\"']"
     r"|\.error\(\s*f?[\"']"
     r"|print\(\s*f?[\"'](?:error|warning):"
     r"|print\(\s*f?[\"'](?=.*\bfile=sys\.stderr\b)"
+    r"|\bsay\(\s*t?[\"'](?=.*\bfile=sys\.stderr\b)"
     r"|\bstderr\.write\(\s*f?[\"']"
     r"|\bhelp=\s*f?[\"']"
     r"|\b(?:hard|warn)\.append\(\s*f?[\"']"
@@ -27,7 +30,7 @@ EMITTER = re.compile(
 JOINER = re.compile(r'(?<!\s);(?= \S)|[\u2013\u2014]')
 # ruff format puts a long call's literals on the lines after its `(`, often split in two.
 OPEN_PAREN = re.compile(r'\(\s*\n\s*')
-SPLIT_LITERAL = re.compile(r'(["\'])[ \t]*\n\s*[rRbBuUfF]{0,2}(["\'])')
+SPLIT_LITERAL = re.compile(r'(["\'])[ \t]*\n\s*[rRbBuUfFtT]{0,2}(["\'])')
 
 
 def production(name: str) -> bool:
@@ -138,6 +141,7 @@ echo "::notice::a label: a value"; exit 0
 echo "plain log line; not read as a message"
     die "no build on npm$([ "$st" = a ] || echo " above"); the run stays held"
 echo "::warning::${r}: is not {\"a\": 1}; read anyway"
+print(workflow_commands.command('error', f'{repo}: {err}; nothing moved'))
 """
         self.assertEqual(
             list(keys(text)),
@@ -149,6 +153,7 @@ echo "::warning::${r}: is not {\"a\": 1}; read anyway"
                 (5, 'carries no bundle; its SBOM is'),
                 (10, 'echo " above"); the run stays'),
                 (11, 'not {\\"a\\": 1}; read anyway'),
+                (12, '{repo}: {err}; nothing moved'),
             ],
         )
 

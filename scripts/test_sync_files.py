@@ -481,7 +481,7 @@ class TwoBranch(unittest.TestCase):
 
     def test_the_summary_counts_targets(self):
         self.assertIn('::group::cplieger/edge (base: dev)', self.got['stdout'])
-        self.assertIn('\n3 target(s): 2 synced · 1 already in sync', self.got['stdout'])
+        self.assertIn('\n- 3 target(s): 2 synced · 1 already in sync', self.got['stdout'])
 
     def test_the_main_head_is_the_one_the_intake_accepts(self):
         import release_channels
@@ -571,11 +571,11 @@ class SweepLookups(unittest.TestCase):
         proc, calls = run_sweep(TWO_BRANCH_MANIFEST, fixture)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(
-            [line for line in proc.stdout.splitlines() if line.startswith('Enabling')],
+            [line for line in proc.stdout.splitlines() if line.startswith('- Enabling')],
             [
-                'Enabling auto-merge on cplieger/a#8',
-                'Enabling auto-merge on cplieger/edge#11',
-                'Enabling auto-merge on cplieger/edge#12',
+                '- Enabling auto-merge on cplieger/a#8',
+                '- Enabling auto-merge on cplieger/edge#11',
+                '- Enabling auto-merge on cplieger/edge#12',
             ],
         )
         self.assertEqual(
@@ -593,8 +593,8 @@ class SweepLookups(unittest.TestCase):
         proc, _calls = run_sweep(TWO_BRANCH_MANIFEST, fixture)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn('::warning::cplieger/a: the open sync PR lookup failed: GET ', proc.stdout)
-        enabling = [line for line in proc.stdout.splitlines() if line.startswith('Enabling')]
-        self.assertEqual(enabling, ['Enabling auto-merge on cplieger/edge#12'])
+        enabling = [line for line in proc.stdout.splitlines() if line.startswith('- Enabling')]
+        self.assertEqual(enabling, ['- Enabling auto-merge on cplieger/edge#12'])
 
 
 class Concurrent(unittest.TestCase):
@@ -871,7 +871,7 @@ class ArmDefault(unittest.TestCase):
         sent, out = self.arm(gh_failed(b'API rate limit exceeded'), now_merged=True)
         self.assertEqual(sent, [])
         self.assertEqual(self.reads, [('repos/cplieger/a/pulls/7',)])
-        self.assertEqual(out, 'Enabling auto-merge on cplieger/a#7\ncplieger/a#7: merged\n')
+        self.assertEqual(out, '- Enabling auto-merge on cplieger/a#7\n- cplieger/a#7: merged\n')
         import ghrest
 
         sent, out = self.arm(gh_failed(b'API rate limit exceeded'), ghrest.ApiError(403, 'held'))

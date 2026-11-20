@@ -63,6 +63,20 @@ jobs:
           # do not leave the token in .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # Every later step reads the workspace as the repository's own.
+      - name: Move the ci source out of the workspace
+        run: |
+          set -euo pipefail
+          mv "$GITHUB_WORKSPACE/.cplieger-ci" "$RUNNER_TEMP/cplieger-ci"
+
       # A nested module's central file names go alone, because deadset-ts at
       # the root already reads every tsconfig under it; its deadset.json still
       # outranks the central file.
@@ -118,16 +132,19 @@ jobs:
       # for minutes after each tag; `go get` ignores that error, so the pin is
       # resolved in a throwaway module and built there.
       - name: Install deadset
+        env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           retry() {
             local attempt=1 max=4 delay=5
             until "$@"; do
               if [ "$attempt" -ge "$max" ]; then
-                echo "::error::$* failed after ${max} attempts"
+                gha_annotate error '%s failed after %s attempts' "$*" "${max}"
                 return 1
               fi
-              echo "::warning::$* attempt ${attempt}/${max} failed; retrying in ${delay}s"
+              gha_annotate warning '%s attempt %s/%s failed, so it is retried in %ss' "$*" "${attempt}" "${max}" "${delay}"
               sleep "${RETRY_SLEEP:-$delay}"
               attempt=$((attempt + 1))
               delay=$((delay * 2))
@@ -155,21 +172,23 @@ jobs:
       - name: Languages in scope (deadset)
         id: census
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           TARGET: ${{ inputs.target }}
           WORK: ${{ steps.target.outputs.work }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           rc=0
           deadset print-languages --target=. --central="$WORK/central.json" \
             > "$WORK/census.json" 2> "$WORK/census.err" || rc=$?
           cat "$WORK/census.err" >&2
           if [ "$rc" -eq 3 ] && grep -q '^setup failure: no-program: ' "$WORK/census.err"; then
-            echo "::notice::deadset finds no program at $TARGET, so there is nothing to check."
+            gha_annotate notice 'deadset finds no program at %s, so there is nothing to check.' "$TARGET"
             echo "analyze=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$rc" -ne 0 ]; then
-            echo "::error::deadset print-languages exited $rc, so the languages in scope at $TARGET are unknown and nothing was checked. Its error is above."
+            gha_annotate error 'deadset print-languages exited %s, so the languages in scope at %s are unknown and nothing was checked. Its error is above.' "$rc" "$TARGET"
             exit 1
           fi
           if ! jq -e '(.languages | type == "array" and length > 0) and (.analyzers | type == "array")' \
@@ -192,7 +211,7 @@ jobs:
               deadset-go) go=true ;;
               deadset-ts) ts=true ;;
               *)
-                echo "::error::deadset would run the analyzer $name at $TARGET, and this check installs only deadset-go and deadset-ts. Leave providers.analyzers out of deadset.json."
+                gha_annotate error 'deadset would run the analyzer %s at %s, and this check installs only deadset-go and deadset-ts. Leave providers.analyzers out of deadset.json.' "$name" "$TARGET"
                 exit 1
                 ;;
             esac
@@ -222,7 +241,7 @@ jobs:
             esac
           done < <(git ls-files -- ':(glob)**/package-lock.json' ':(glob)**/package.json')
           if [ "$ts" = true ] && [ "$manifests" -gt 0 ] && [ "${#npm_dirs[@]}" -eq 0 ]; then
-            echo "::error::TypeScript is in scope at $TARGET ($(from ts)), but no package-lock.json is tracked under it, so its dependencies cannot be installed for deadset-ts. Commit the lockfile, or add a root deadset.json whose analysis.languages leaves ts out."
+            gha_annotate error 'TypeScript is in scope at %s (%s), but no package-lock.json is tracked under it, so its dependencies cannot be installed for deadset-ts. Commit the lockfile, or add a root deadset.json whose analysis.languages leaves ts out.' "$TARGET" "$(from ts)"
             exit 1
           fi
           prefix=""
@@ -266,21 +285,23 @@ jobs:
       - name: Install analyzers and dependencies
         if: ${{ steps.census.outputs.analyze == 'true' }}
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           GO: ${{ steps.census.outputs.go }}
           TS: ${{ steps.census.outputs.ts }}
           GO_DIRS: ${{ steps.census.outputs.go_dirs }}
           NPM_DIRS: ${{ steps.census.outputs.npm_dirs }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           # Install deadset's retry and install_pinned, for the same proxy faults.
           retry() {
             local attempt=1 max=4 delay=5
             until "$@"; do
               if [ "$attempt" -ge "$max" ]; then
-                echo "::error::$* failed after ${max} attempts"
+                gha_annotate error '%s failed after %s attempts' "$*" "${max}"
                 return 1
               fi
-              echo "::warning::$* attempt ${attempt}/${max} failed; retrying in ${delay}s"
+              gha_annotate warning '%s attempt %s/%s failed, so it is retried in %ss' "$*" "${attempt}" "${max}" "${delay}"
               sleep "${RETRY_SLEEP:-$delay}"
               attempt=$((attempt + 1))
               delay=$((delay * 2))
@@ -304,7 +325,7 @@ jobs:
           fi
           while IFS= read -r dir; do
             if [ -z "$dir" ]; then continue; fi
-            echo "npm ci in $dir"
+            gha_say 'npm ci in %s' "$dir"
             (cd "$dir" && npm ci --ignore-scripts --no-audit --no-fund)
           done < <(printf '%s\n' "$NPM_DIRS")
 
@@ -325,10 +346,12 @@ jobs:
       - name: Spec skew (deadset)
         if: ${{ steps.census.outputs.analyze == 'true' && inputs.repository != '' }}
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           GO: ${{ steps.census.outputs.go }}
           TS: ${{ steps.census.outputs.ts }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           spec_go() {
             go version -m "$(command -v "$1")" | awk '
               held { if ($1 != "=>") print version; held = 0 }
@@ -351,7 +374,7 @@ jobs:
           }
           host="$(spec_go deadset)"
           if [ -z "$host" ]; then
-            echo "::error::deadset $DEADSET_VERSION records no deadset-spec version in its build info, so its spec cannot be checked against the analyzers'."
+            gha_annotate error "deadset %s records no deadset-spec version in its build info, so its spec cannot be checked against the analyzers'." "$DEADSET_VERSION"
             exit 1
           fi
           analyzers=()
@@ -368,17 +391,17 @@ jobs:
           for entry in "${analyzers[@]}"; do
             read -r name version spec <<<"$entry"
             if [ -z "${spec:-}" ]; then
-              echo "::error::$name $version names no deadset-spec version, so its spec cannot be checked against deadset's."
+              gha_annotate error "%s %s names no deadset-spec version, so its spec cannot be checked against deadset's." "$name" "$version"
               exit 1
             fi
             rc=0
             precedes "$host" "$spec" || rc=$?
             if [ "$rc" -eq 0 ]; then
-              echo "::error::deadset $DEADSET_VERSION is on deadset-spec $host, older than $name $version on deadset-spec $spec, so deadset refuses report values that analyzer may write. Move the deadset pin to a release on deadset-spec $spec or newer."
+              gha_annotate error 'deadset %s is on deadset-spec %s, older than %s %s on deadset-spec %s, so deadset refuses report values that analyzer may write. Move the deadset pin to a release on deadset-spec %s or newer.' "$DEADSET_VERSION" "$host" "$name" "$version" "$spec" "$spec"
               skewed=1
               continue
             elif [ "$rc" -ne 1 ]; then
-              echo "::error::the deadset-spec versions $host and $spec cannot be ordered."
+              gha_annotate error 'the deadset-spec versions %s and %s cannot be ordered.' "$host" "$spec"
               exit 1
             fi
             echo "$name $version on deadset-spec $spec; deadset $DEADSET_VERSION on deadset-spec $host"
@@ -393,12 +416,14 @@ jobs:
       - name: Dead code (deadset)
         if: ${{ steps.census.outputs.analyze == 'true' }}
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           TARGET: ${{ inputs.target }}
           EXIT_CODE: ${{ inputs.exit-code }}
           WORK: ${{ steps.target.outputs.work }}
           NPM_DIRS: ${{ steps.census.outputs.npm_dirs }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           misplaced=0
           while IFS= read -r dir; do
             if [ -z "$dir" ] || [ "$dir" = . ]; then continue; fi
@@ -406,7 +431,7 @@ jobs:
               if [ -n "$(git ls-files -- "$dir/$name")" ]; then
                 rel="$dir/$name"
                 if [ "$TARGET" != . ]; then rel="$TARGET/$rel"; fi
-                echo "::error file=$rel::$rel is never read: deadset reads $name at the target root, $TARGET, only. Move it there and make its paths relative to that root."
+                gha_annotate error -p file="$rel" '%s is never read: deadset reads %s at the target root, %s, only. Move it there and make its paths relative to that root.' "$rel" "$name" "$TARGET"
                 misplaced=1
               fi
             done
@@ -418,7 +443,7 @@ jobs:
           deadset analyze --target=. --central="$WORK/central.json" --run-dir="$WORK/run" \
             --formats=text,sarif --exit-code="$EXIT_CODE" || rc=$?
           if { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; } && [ ! -s "$WORK/run/report.json.sarif" ]; then
-            echo "::error::deadset exited $rc but wrote no SARIF report to $WORK/run/report.json.sarif, though --formats=text,sarif asked for one, so its findings cannot reach code scanning."
+            gha_annotate error 'deadset exited %s but wrote no SARIF report to %s/run/report.json.sarif, though --formats=text,sarif asked for one, so its findings cannot reach code scanning.' "$rc" "$WORK"
             exit 1
           fi
           case "$rc" in
@@ -444,7 +469,7 @@ jobs:
               exit 1
               ;;
             *)
-              echo "::error::deadset exited $rc, which is no verdict, so nothing was checked."
+              gha_annotate error 'deadset exited %s, which is no verdict, so nothing was checked.' "$rc"
               exit 1
               ;;
           esac

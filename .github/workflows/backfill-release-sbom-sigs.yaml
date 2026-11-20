@@ -58,6 +58,16 @@ jobs:
       contents: read
       id-token: write # keyless cosign signing
     steps:
+      - name: Checkout ci (for gha-log.sh)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _ci
+          persist-credentials: false
+          sparse-checkout: scripts/gha-log.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install cosign
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
@@ -71,6 +81,7 @@ jobs:
           INPUT_REPOS: ${{ inputs.repos }}
         run: |
           set -euf -o pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           if [ "${INPUT_REPOS}" = "all" ]; then
             names="${FLEET}"
           else
@@ -79,7 +90,7 @@ jobs:
           repos=""
           for repo in ${names}; do
             case "${repo}" in
-              *[!A-Za-z0-9._-]* | . | ..) printf "::error::not a repository name: '%s'\n" "${repo}"; exit 1 ;;
+              *[!A-Za-z0-9._-]* | . | ..) gha_annotate error "not a repository name: '%s'" "${repo}"; exit 1 ;;
             esac
             repos="${repos:+${repos},}${repo}"
           done
@@ -108,8 +119,9 @@ jobs:
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           case "${INPUT_LIMIT}" in
-            '' | *[!0-9]* | 0) echo "::error::limit must be a positive integer, got '${INPUT_LIMIT}'"; exit 1 ;;
+            '' | *[!0-9]* | 0) gha_annotate error "limit must be a positive integer, got '%s'" "${INPUT_LIMIT}"; exit 1 ;;
           esac
           # Over REST, newest first: the App installation's GraphQL quota is shared
           # with Renovate, which runs as the same App. A listing carries each
@@ -121,7 +133,7 @@ jobs:
           signed=0
           skipped=0
           for repo in ${REPOS//,/ }; do
-            echo "::group::cplieger/${repo}"
+            gha_annotate group 'cplieger/%s' "${repo}"
             listing="$(gh api "${paginate[@]}" "repos/cplieger/${repo}/releases?per_page=${per_page}" \
               --jq '.[] | {tag: .tag_name, immutable: (.immutable == true), assets: [.assets[] | {id, name}]} | @json' 2>/dev/null \
               | head -n "${INPUT_LIMIT}" || true)"
@@ -137,18 +149,18 @@ jobs:
               case "${assets}" in
                 *sbom.spdx.json*) : ;;
                 *)
-                  echo "${tag}: no sbom.spdx.json asset, skip"
+                  gha_say '%s: no sbom.spdx.json asset, skip' "${tag}"
                   skipped=$((skipped + 1))
                   continue
                   ;;
               esac
               if printf '%s\n' "${assets}" | grep -qE '\.(sig|pem|sigstore\.json)$'; then
-                echo "${tag}: already has a signature asset, skip"
+                gha_say '%s: already has a signature asset, skip' "${tag}"
                 skipped=$((skipped + 1))
                 continue
               fi
               if [ "$(jq -r .immutable <<< "${release}")" = "true" ]; then
-                echo "${tag}: immutable release, assets cannot be added"
+                gha_say '%s: immutable release, assets cannot be added' "${tag}"
                 skipped=$((skipped + 1))
                 continue
               fi
@@ -158,7 +170,7 @@ jobs:
               gh api -H 'Accept: application/octet-stream' \
                 "repos/cplieger/${repo}/releases/assets/${id}" > "${d}/sbom.spdx.json"
               if [ "${INPUT_DRY_RUN}" = "true" ]; then
-                echo "${tag}: WOULD sign + upload sbom.spdx.json.sigstore.json"
+                gha_say '%s: WOULD sign + upload sbom.spdx.json.sigstore.json' "${tag}"
                 signed=$((signed + 1))
                 continue
               fi
@@ -166,12 +178,12 @@ jobs:
                 --bundle "${d}/sbom.spdx.json.sigstore.json"
               gh release upload "${tag}" -R "cplieger/${repo}" \
                 "${d}/sbom.spdx.json.sigstore.json"
-              echo "${tag}: signed + uploaded sbom.spdx.json.sigstore.json"
+              gha_say '%s: signed + uploaded sbom.spdx.json.sigstore.json' "${tag}"
               signed=$((signed + 1))
             done 3<<< "${listing}"
             echo "::endgroup::"
           done
-          echo "Done. signed=${signed} skipped=${skipped} dry_run=${INPUT_DRY_RUN}"
+          gha_say 'Done. signed=%s skipped=%s dry_run=%s' "${signed}" "${skipped}" "${INPUT_DRY_RUN}"
 
   # `needs:` must list every other job in this workflow. Dispatch-only, so a
   # failure files only when the run was long enough to be unwatched.

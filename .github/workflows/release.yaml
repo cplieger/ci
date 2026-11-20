@@ -77,6 +77,17 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      # Every job runs the scripts and actions of the commit this workflow
+      # runs from, checked out beside the consumer's tree: a `uses:` ref to
+      # this repository would run another commit's code under the caller's pin.
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
       # The only place in the release pipeline that maps the branch to a
       # channel; docker-release.yaml receives the channel as data and only
       # re-validates the caller and ref. It also refuses a caller or a ref
@@ -85,6 +96,7 @@ jobs:
       - name: Select channel
         id: channel
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           REPO_PRIVATE: ${{ github.event.repository.private }}
           REPO_FORK: ${{ github.event.repository.fork }}
@@ -93,15 +105,16 @@ jobs:
           INPUT_MODE: ${{ github.event.inputs.mode }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           if [ "$DEFAULT_BRANCH" != dev ] || [ "$REPO_PRIVATE" = true ] || [ "$REPO_FORK" = true ]; then
-            echo "::error::release.yaml publishes only from a public, non-fork repository whose default branch is dev (this one: default branch ${DEFAULT_BRANCH:-<unknown>}, private ${REPO_PRIVATE:-<unknown>}, fork ${REPO_FORK:-<unknown>}). Make dev the default branch, or remove the release.yaml caller and publish from the repository's own workflow."
+            gha_annotate error "release.yaml publishes only from a public, non-fork repository whose default branch is dev (this one: default branch %s, private %s, fork %s). Make dev the default branch, or remove the release.yaml caller and publish from the repository's own workflow." "${DEFAULT_BRANCH:-<unknown>}" "${REPO_PRIVATE:-<unknown>}" "${REPO_FORK:-<unknown>}"
             exit 1
           fi
           case "$GITHUB_REF" in
             refs/heads/dev) CHANNEL=dev ;;
             refs/heads/main) CHANNEL=stable ;;
             *)
-              echo "::error::release.yaml publishes only from refs/heads/dev (the dev channel) or refs/heads/main (the stable channel), not ${GITHUB_REF:-<unknown>}. Push or dispatch on dev or main."
+              gha_annotate error 'release.yaml publishes only from refs/heads/dev (the dev channel) or refs/heads/main (the stable channel), not %s. Push or dispatch on dev or main.' "${GITHUB_REF:-<unknown>}"
               exit 1
               ;;
           esac
@@ -112,18 +125,18 @@ jobs:
             '' | normal) ;;
             renumber)
               if [ "$CHANNEL" != dev ]; then
-                echo "::error::mode=renumber renumbers dev builds. Dispatch it on dev, not on ${GITHUB_REF}."
+                gha_annotate error 'mode=renumber renumbers dev builds. Dispatch it on dev, not on %s.' "${GITHUB_REF}"
                 exit 1
               fi
               MODE=renumber
               ;;
             *)
-              echo "::error::unknown mode '${INPUT_MODE}' (normal or renumber)"
+              gha_annotate error "unknown mode '%s' (normal or renumber)" "${INPUT_MODE}"
               exit 1
               ;;
           esac
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "Default branch: ${DEFAULT_BRANCH}, mode: $MODE"
+          gha_say 'Default branch: %s, mode: %s' "${DEFAULT_BRANCH}" "$MODE"
 
       - name: Detect type + subpackages
         id: type
@@ -157,23 +170,13 @@ jobs:
           echo "subpackages=$SUBS" >> "$GITHUB_OUTPUT"
           echo "type=$TYPE  subpackages=$SUBS"
 
-      # Every job runs the scripts and actions of the commit this workflow
-      # runs from, checked out beside the consumer's tree: a `uses:` ref to
-      # this repository would run another commit's code under the caller's pin.
-      - name: Check out the ci source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: .cplieger-ci
-          persist-credentials: false
-
       - name: Detect nested Go modules
         id: gomodules
         env:
           CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           # Nested Go modules (scripts/go-modules.sh list) each get their
           # own release lane: independent conventional-commit versioning and
           # <dir>/vX.Y.Z tags (the go-nested job below). Works for any repo
@@ -205,23 +208,23 @@ jobs:
             f="$d/go.mod"
             case "$d" in
               *[!A-Za-z0-9._/-]*)
-                echo "::error::nested go.mod dir '$d' contains characters outside [A-Za-z0-9._/-]; not a valid Go module path element"
+                gha_annotate error "nested go.mod dir '%s' contains characters outside [A-Za-z0-9._/-], so it is not a valid Go module path element" "$d"
                 exit 1 ;;
             esac
             case "/$d/" in
               */internal/*)
-                echo "::notice::nested module '$d' is under internal/ — validated by CI, not released"
+                gha_annotate notice "nested module '%s' is under internal/, so CI validates it and nothing releases it" "$d"
                 continue ;;
             esac
             modpath=$(awk '$1=="module"{print $2; exit}' "$f")
             case "${modpath%%/*}" in
               *.*) : ;;
               *)
-                echo "::notice::nested go.mod '$f' (module '${modpath:-<none>}') has a dotless first path element — a sentinel/local module, not a release lane"
+                gha_annotate notice "nested go.mod '%s' (module '%s') has a dotless first path element, so it is a sentinel or local module and not a release lane" "$f" "${modpath:-<none>}"
                 continue ;;
             esac
             if [ -z "$(git ls-files -- "$d/*.go" | head -1)" ]; then
-              echo "::notice::nested module '$d' has no tracked .go files — not a release lane"
+              gha_annotate notice "nested module '%s' has no tracked .go files, so it is not a release lane" "$d"
               continue
             fi
             LANES=$(echo "$LANES" | jq -c --arg v "$d" '. + [$v]')
@@ -232,7 +235,7 @@ jobs:
             while IFS= read -r b; do
               [ -z "$b" ] && continue
               if [ "$a" != "$b" ] && [ "${b#"$a"/}" != "$b" ]; then
-                echo "::error::nested Go modules '$a' and '$b' overlap (one contains the other); restructure so lane dirs are disjoint"
+                gha_annotate error "nested Go modules '%s' and '%s' overlap (one contains the other). Restructure them so lane dirs are disjoint." "$a" "$b"
                 exit 1
               fi
             done < <(echo "$LANES" | jq -r '.[]')
@@ -244,7 +247,7 @@ jobs:
             [ -z "$d" ] && continue
             [ -n "$(git ls-files -- "$d/web/jsr.json")" ] || continue
             if [ -z "$(git ls-files -- "$d/web/package.json")" ]; then
-              echo "::error::$d/web/jsr.json has no package.json beside it. A lane's TS half publishes to npm, then JSR."
+              gha_annotate error "%s/web/jsr.json has no package.json beside it. A lane's TS half publishes to npm, then JSR." "$d"
               exit 1
             fi
             HALVES=$(echo "$HALVES" | jq -c --arg v "$d" '. + [$v]')
@@ -417,6 +420,7 @@ jobs:
       - name: Select version
         id: select
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           CHANNEL: ${{ steps.channel.outputs.channel }}
           MODE: ${{ steps.channel.outputs.mode }}
           REPO_TYPE: ${{ steps.type.outputs.type }}
@@ -428,9 +432,10 @@ jobs:
           ANCHOR_SHA: ${{ steps.cliff.outputs.anchor_sha }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           if [ "$REPO_TYPE" = none ]; then
             if [ "$SUBPACKAGES_TO_PUBLISH" != "[]" ]; then
-              echo "::error::TS subpackages ${SUBPACKAGES_TO_PUBLISH} share the root version, but this root has no Dockerfile, jsr.json or go.mod, so it has none. Move each into a nested Go module's web/ directory, or give the root a type."
+              gha_annotate error "TS subpackages %s share the root version, but this root has no Dockerfile, jsr.json or go.mod, so it has none. Move each into a nested Go module's web/ directory, or give the root a type." "${SUBPACKAGES_TO_PUBLISH}"
               exit 1
             fi
             {
@@ -489,10 +494,12 @@ jobs:
       - name: Resolve repo policy
         id: policy
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           REPO_NAME: ${{ github.event.repository.name }}
           REPO_SPDX_ID: ${{ github.event.repository.license.spdx_id }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           # Per-repo policy overrides. Centralized here, NOT per-repo config.
           # When you need to change a repo's release behavior, edit this step.
           #
@@ -589,7 +596,7 @@ jobs:
             echo "binaries=$BINARIES"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Policy: registries=$REGISTRIES platforms=$PLATFORMS syft_config='$SYFT_CONFIG' image_licenses='$IMAGE_LICENSES' runner_image_licenses='$RUNNER_IMAGE_LICENSES' binaries='$BINARIES'"
+          gha_say "Policy: registries=%s platforms=%s syft_config='%s' image_licenses='%s' runner_image_licenses='%s' binaries='%s'" "$REGISTRIES" "$PLATFORMS" "$SYFT_CONFIG" "$IMAGE_LICENSES" "$RUNNER_IMAGE_LICENSES" "$BINARIES"
 
   # ─── Claim the root version before any build ───────────────────────────────
   # A push that edits workflow files and lands during the build makes GitHub
@@ -690,6 +697,7 @@ jobs:
           TAG: ${{ matrix.tag }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           bash "$CI_TOOLS/release-state.sh" handoff-name repair-notes "$TAG" | sed 's/^/artifact=/' >> "$GITHUB_OUTPUT"
           state=$(bash "$CI_TOOLS/release-exists.sh" "$TAG")
           if [ "$state" = present ]; then
@@ -697,7 +705,7 @@ jobs:
             echo "${TAG} has its Release; reading it back"
           else
             echo "missing=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::${TAG} has no Release, so its notes are rendered at its own commit"
+            gha_annotate notice '%s has no Release, so its notes are rendered at its own commit' "${TAG}"
           fi
 
       # Installs the pinned git-cliff; the computed version is not read.
@@ -922,18 +930,6 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.detect.outputs.repairs) }}
     steps:
-      - name: Require the Release and the subpackages
-        env:
-          NOTES: ${{ needs.repair-notes.result }}
-          RELEASE: ${{ needs.repair-release.result }}
-          PUBLISH: ${{ needs.repair-publish.result }}
-        run: |
-          set -euo pipefail
-          if [ "$NOTES" != success ] || [ "$RELEASE" != success ] || { [ "$PUBLISH" != success ] && [ "$PUBLISH" != skipped ]; }; then
-            echo "::error::repair-notes ${NOTES}, repair-release ${RELEASE}, repair-publish ${PUBLISH}: no receipt is recorded and nothing publishes"
-            exit 1
-          fi
-
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -949,6 +945,20 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .cplieger-ci
           persist-credentials: false
+
+      - name: Require the Release and the subpackages
+        env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
+          NOTES: ${{ needs.repair-notes.result }}
+          RELEASE: ${{ needs.repair-release.result }}
+          PUBLISH: ${{ needs.repair-publish.result }}
+        run: |
+          set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
+          if [ "$NOTES" != success ] || [ "$RELEASE" != success ] || { [ "$PUBLISH" != success ] && [ "$PUBLISH" != skipped ]; }; then
+            gha_annotate error 'repair-notes %s, repair-release %s, repair-publish %s: no receipt is recorded and nothing publishes' "${NOTES}" "${RELEASE}" "${PUBLISH}"
+            exit 1
+          fi
 
       # The image readback proves the tag's digest by its signature.
       - name: Install Cosign
@@ -1029,6 +1039,7 @@ jobs:
           IMAGE: ${{ github.repository_owner }}/${{ github.event.repository.name }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           # A called workflow's GITHUB_WORKFLOW_REF names its caller, `<owner>/<repo>/<path>@<ref>`
           # (https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations#github-context).
           echo "caller workflow: $GITHUB_WORKFLOW_REF"
@@ -1036,7 +1047,7 @@ jobs:
           case "$path" in
             "$GITHUB_REPOSITORY"/.github/workflows/*) ;;
             *)
-              echo "::error::GITHUB_WORKFLOW_REF names $GITHUB_WORKFLOW_REF, no workflow of $GITHUB_REPOSITORY, so the barrier has nothing to dispatch"
+              gha_annotate error 'GITHUB_WORKFLOW_REF names %s, no workflow of %s, so the barrier has nothing to dispatch' "$GITHUB_WORKFLOW_REF" "$GITHUB_REPOSITORY"
               exit 1
               ;;
           esac
@@ -1664,11 +1675,28 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Check out the ci source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .cplieger-ci
+          persist-credentials: false
+
+      # gorelease refuses a tree `git status --porcelain` calls dirty, and the
+      # untracked ci source would make it one.
+      - name: Move the ci source out of the module
+        run: |
+          set -euo pipefail
+          mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
+
       - name: Verify root module path
         env:
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           # The root module's path must be exactly github.com/<owner>/<repo>,
           # plus /vN for major >= 2 (Go semantic import versioning). Both halves
           # are invisible until a consumer runs `go get`, and neither is fixable
@@ -1687,7 +1715,7 @@ jobs:
           expected="$base"
           case "$major" in
             '' | *[!0-9]*)
-              echo "::notice::'$VERSION' has no numeric major — applying the base-path rule only" ;;
+              gha_annotate notice "'%s' has no numeric major, so only the base-path rule applies" "$VERSION" ;;
             *)
               if [ "$major" -ge 2 ]; then
                 expected="${base}/v${major}"
@@ -1697,31 +1725,16 @@ jobs:
                 case "$modpath" in
                   "$expected") : ;;
                   "$base" | "$base"/v[0-9]*)
-                    echo "::error::go.mod module path '$modpath' must end in /v$major to release $VERSION (Go semantic import versioning). Add the /v$major suffix to the module directive and rewrite internal imports, then re-release."
+                    gha_annotate error "go.mod module path '%s' must end in /v%s to release %s (Go semantic import versioning). Add the /v%s suffix to the module directive and rewrite internal imports, then re-release." "$modpath" "$major" "$VERSION" "$major"
                     exit 1 ;;
                 esac
               fi ;;
           esac
           if [ "$modpath" != "$expected" ]; then
-            echo "::error::go.mod module path '$modpath' must be '$expected' to release $VERSION; a module path must name its own repository or Go tooling cannot fetch it. Fix the module directive (and internal imports for a /vN major), then re-release."
+            gha_annotate error "go.mod module path '%s' must be '%s' to release %s. A module path must name its own repository or Go tooling cannot fetch it. Fix the module directive (and internal imports for a /vN major), then re-release." "$modpath" "$expected" "$VERSION"
             exit 1
           fi
           echo "ok: module path '$modpath' matches '$expected' ($VERSION)"
-
-      - name: Check out the ci source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: .cplieger-ci
-          persist-credentials: false
-
-      # gorelease refuses a tree `git status --porcelain` calls dirty, and the
-      # untracked ci source would make it one.
-      - name: Move the ci source out of the module
-        run: |
-          set -euo pipefail
-          mv .cplieger-ci "$RUNNER_TEMP/cplieger-ci"
 
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -1745,6 +1758,7 @@ jobs:
           VERSION: ${{ needs.detect.outputs.base }}
         run: |
           set -uo pipefail
+          . "$CI_TOOLS/gha-log.sh"
 
           if ls ./*.go >/dev/null 2>&1 && grep -qE '^package main$' ./*.go 2>/dev/null; then
             echo "::notice::root package is main (application, not a consumed module) - skipping API check"
@@ -1760,7 +1774,7 @@ jobs:
           fi
           prev_major="${prev#v}"; prev_major="${prev_major%%.*}"
           if [ "$major" != "$prev_major" ]; then
-            echo "::notice::major bump ${prev} -> ${VERSION}: a break is deliberate here, so a report carries no information - skipping"
+            gha_annotate notice 'major bump %s -> %s: a break is deliberate here, so a report carries no information and gorelease is skipped' "${prev}" "${VERSION}"
             exit 0
           fi
 
@@ -1932,14 +1946,14 @@ jobs:
           # unreadable from a terminal exactly when it needs investigating.
           # Only for a non-ok verdict, since this step runs on every library release.
           if [ "$verdict" != ok ]; then
-            echo "::group::gorelease report (${prev} -> ${VERSION}, verdict: ${verdict})"
+            gha_annotate group 'gorelease report (%s -> %s, verdict: %s)' "${prev}" "${VERSION}" "${verdict}"
             head -c 8000 "$out"
             echo "::endgroup::"
           fi
 
           case "$verdict" in
             api)
-              echo "::error::gorelease rejected ${VERSION} for these exported-surface changes (report above, and in the run summary)"
+              gha_annotate error 'gorelease rejected %s for these exported-surface changes (report above, and in the run summary)' "${VERSION}"
               exit 1
               ;;
             usage)
@@ -1947,7 +1961,7 @@ jobs:
               exit 1
               ;;
             accepted)
-              echo "::notice::every incompatible change gorelease reported for ${VERSION} is in api-accept.txt (report above, and in the run summary)"
+              gha_annotate notice 'every incompatible change gorelease reported for %s is in api-accept.txt (report above, and in the run summary)' "${VERSION}"
               exit 0
               ;;
             accept-error)
@@ -1958,7 +1972,7 @@ jobs:
               # Fail OPEN, on the same reasoning as the install failure above: an
               # unreachable checker is an infrastructure fault, and failing every
               # release on one teaches every consumer repo to ignore this step.
-              echo "::warning::gorelease could not run; ${VERSION} published WITHOUT an API check (report above, and in the run summary)"
+              gha_annotate warning 'gorelease could not run, so %s published WITHOUT an API check (report above, and in the run summary)' "${VERSION}"
               exit 0
               ;;
           esac
@@ -2006,6 +2020,7 @@ jobs:
           CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           # The tag is the module version itself, claimed at the trigger commit
           # (tag-ref.sh claim_version); a handoff publishes nothing and posts
           # no receipt. The Release attaches to the tag (no --target). A dev
@@ -2024,7 +2039,7 @@ jobs:
               -f description="created by the dev release run" \
               -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
               if [ "$TAG_CREATED" = true ]; then
-                echo "::error::receipt for ${VERSION} not recorded; deleting the tag this run created so a rerun recreates both"
+                gha_annotate error 'receipt for %s not recorded, so the tag this run created is deleted and a rerun recreates both' "${VERSION}"
                 gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}" >/dev/null
               fi
               exit 1
@@ -2120,10 +2135,12 @@ jobs:
           # NPM: trusted publisher configured at npmjs.com pointing to this
           #      workflow + repo (auto-attaches provenance attestation).
           # JSR: trusted publisher configured at jsr.io at the scope level.
+          CI_TOOLS: ${{ runner.temp }}/cplieger-ci/scripts
           VERSION: ${{ needs.detect.outputs.version }}
           CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           ver="${VERSION#v}"
           pkg="$(npm pkg get name | tr -d '\"')"
           npm pkg set version="$ver"
@@ -2136,7 +2153,7 @@ jobs:
           fi
           # Skip NPM if version already exists (bootstrap-friendly).
           if npm view "$pkg@$ver" version >/dev/null 2>&1; then
-            echo "::notice::npm: $pkg@$ver already published — skipping"
+            gha_annotate notice 'npm: %s@%s is already published, so it is skipped' "$pkg" "$ver"
           else
             npm publish --access public "${NPM_TAG_ARGS[@]}"
           fi
@@ -2150,7 +2167,7 @@ jobs:
           # the version). Mirror of the npm guard above.
           if curl -fsSL "https://jsr.io/${pkg}/meta.json" \
                | jq -e --arg v "$ver" '.versions[$v]' >/dev/null 2>&1; then
-            echo "::notice::jsr: $pkg@$ver already published — skipping"
+            gha_annotate notice 'jsr: %s@%s is already published, so it is skipped' "$pkg" "$ver"
           else
             # Pin the jsr CLI: a bare `npx jsr` fetches whatever is latest at
             # publish time — the one floating executable on the release path.
@@ -2283,6 +2300,7 @@ jobs:
           DIR: ${{ matrix.dir }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           . "$CI_TOOLS/tag-ref.sh"
           rc=0
           package_handed_off "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$VERSION" "$GITHUB_SHA" "$CHANNEL" "$DIR/package.json" || rc=$?
@@ -2290,7 +2308,7 @@ jobs:
             0) echo "handoff=true" >>"$GITHUB_OUTPUT" ;;
             1) echo "handoff=false" >>"$GITHUB_OUTPUT" ;;
             *)
-              echo "::error::whether this run publishes ${DIR} at ${VERSION} cannot be told (${GITHUB_REF_NAME}'s head, its tags or npm are unreadable), so ${DIR} is not published."
+              gha_annotate error "whether this run publishes %s at %s cannot be told (%s's head, its tags or npm are unreadable), so %s is not published." "${DIR}" "${VERSION}" "${GITHUB_REF_NAME}" "${DIR}"
               exit 1
               ;;
           esac
@@ -2439,10 +2457,12 @@ jobs:
       - name: Verify lane module path
         if: ${{ steps.lane.outputs.release == 'true' }}
         env:
+          CI_TOOLS: ${{ github.workspace }}/.cplieger-ci/scripts
           DIR: ${{ matrix.dir }}
           VERSION: ${{ steps.lane.outputs.version }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           # The nested module's path must be exactly
           # github.com/<owner>/<repo>/<dir> (+ /vN for major >= 2, Go semantic
           # import versioning — the root job's check, extended with the exact
@@ -2450,7 +2470,7 @@ jobs:
           # the Go proxy can never serve for this import path.
           modpath=$(awk '$1=="module"{print $2; exit}' "$DIR/go.mod")
           if [ -z "$modpath" ]; then
-            echo "::error::no module directive found in ${DIR}/go.mod"
+            gha_annotate error 'no module directive found in %s/go.mod' "${DIR}"
             exit 1
           fi
           ver="${VERSION#"$DIR"/v}"
@@ -2458,14 +2478,14 @@ jobs:
           expected="github.com/${GITHUB_REPOSITORY}/${DIR}"
           case "$major" in
             '' | *[!0-9]*)
-              echo "::notice::'$VERSION' has no numeric major — applying the base-path rule only" ;;
+              gha_annotate notice "'%s' has no numeric major, so only the base-path rule applies" "$VERSION" ;;
             *)
               if [ "$major" -ge 2 ]; then
                 expected="${expected}/v${major}"
               fi ;;
           esac
           if [ "$modpath" != "$expected" ]; then
-            echo "::error::${DIR}/go.mod module path '$modpath' must be '$expected' to release ${VERSION} (nested Go module lane). Fix the module directive (and internal imports for a /vN major), then re-release."
+            gha_annotate error "%s/go.mod module path '%s' must be '%s' to release %s (nested Go module lane). Fix the module directive (and internal imports for a /vN major), then re-release." "${DIR}" "$modpath" "$expected" "${VERSION}"
             exit 1
           fi
           echo "ok: module path '$modpath' matches lane ${DIR} ($VERSION)"
@@ -2514,6 +2534,7 @@ jobs:
           CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           # The root go job's claim, at the lane's slash tag (an ordinary
           # multi-segment ref). A dev lane build gets the tag, its receipt and
           # no Release.
@@ -2531,7 +2552,7 @@ jobs:
               -f description="created by the dev release run" \
               -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
               if [ "$TAG_CREATED" = true ]; then
-                echo "::error::receipt for ${VERSION} not recorded; deleting the tag this run created so a rerun recreates both"
+                gha_annotate error 'receipt for %s not recorded, so the tag this run created is deleted and a rerun recreates both' "${VERSION}"
                 gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}" >/dev/null
               fi
               exit 1
@@ -2599,6 +2620,7 @@ jobs:
           CHANNEL: ${{ needs.detect.outputs.channel }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           if [ "$CHANNEL" = stable ]; then
             tags=$(git tag --points-at HEAD --list "$LANE/v[0-9]*" | grep -E "^${LANE}/v[0-9]+\.[0-9]+\.[0-9]+\$" || true)
           else
@@ -2608,11 +2630,11 @@ jobs:
           . "$CI_TOOLS/tag-ref.sh"
           if [ -z "$tag" ]; then
             if head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA"); then
-              echo "::warning::lane ${LANE} has no ${CHANNEL} tag at ${GITHUB_SHA} and ${GITHUB_REF_NAME} advanced past it (now ${head}). The run on the new head publishes its TS half."
+              gha_annotate warning 'lane %s has no %s tag at %s and %s advanced past it (now %s). The run on the new head publishes its TS half.' "${LANE}" "${CHANNEL}" "${GITHUB_SHA}" "${GITHUB_REF_NAME}" "${head}"
               echo "tag=" >>"$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "::error::lane ${LANE} has no ${CHANNEL} tag at $(git rev-parse HEAD), though go-nested released it. Its TS half is not published without one."
+            gha_annotate error 'lane %s has no %s tag at %s, though go-nested released it. Its TS half is not published without one.' "${LANE}" "${CHANNEL}" "$(git rev-parse HEAD)"
             exit 1
           fi
           rc=0
@@ -2621,7 +2643,7 @@ jobs:
             0) tag="" ;;
             1) ;;
             *)
-              echo "::error::whether this run publishes lane ${LANE}'s TS half at ${tag} cannot be told (git cannot walk ${GITHUB_REF_NAME}, or npm is unreadable), so it is not published."
+              gha_annotate error "whether this run publishes lane %s's TS half at %s cannot be told (git cannot walk %s, or npm is unreadable), so it is not published." "${LANE}" "${tag}" "${GITHUB_REF_NAME}"
               exit 1
               ;;
           esac
@@ -2698,6 +2720,7 @@ jobs:
           HALVES_RESULT: ${{ needs.lane-halves.result }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           . "$CI_TOOLS/retry.sh"
           ver="${VERSION#v}"
           rc=0
@@ -2707,7 +2730,7 @@ jobs:
               echo "ok: $1"
               return 0
             fi
-            echo "::error::$1 is not published: $2"
+            gha_annotate error '%s is not published: %s' "$1" "$2"
             return 1
           }
           # The proxy is lazy, so this GET is also what makes the module
@@ -2736,11 +2759,11 @@ jobs:
             body=$(cat "$proxy_body")
             case $body in
               *"unknown revision"*)
-                echo "::warning::proxy.golang.org ${modpath}@$2 is not mirrored yet: ${url}"
+                gha_annotate warning 'proxy.golang.org %s@%s is not mirrored yet: %s' "${modpath}" "$2" "${url}"
                 return 0
                 ;;
             esac
-            echo "::error::proxy.golang.org ${modpath}@$2 is not resolvable: ${body}"
+            gha_annotate error 'proxy.golang.org %s@%s is not resolvable: %s' "${modpath}" "$2" "${body}"
             return 1
           }
           # JSR receives the stable channel only, so a dev version is never
@@ -2875,15 +2898,16 @@ jobs:
           GO_NESTED_RESULT: ${{ needs.go-nested.result }}
         run: |
           set -euo pipefail
+          . "$CI_TOOLS/gha-log.sh"
           root_at=$(git rev-list -n1 "$VERSION" 2>/dev/null || true)
           if { [ "$GO_RESULT" = "success" ] || [ "$TS_RESULT" = "success" ]; } && [ -z "$root_at" ]; then
             # A root that handed its tag off to a newer push (tag_ref_or_handoff)
             # left none; the run on the new head records this version's receipt.
             . "$CI_TOOLS/tag-ref.sh"
             if head=$(branch_moved_past "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA"); then
-              echo "::warning::${VERSION} was handed off to ${GITHUB_REF_NAME}'s new head ${head}, so its receipt is that run's"
+              gha_annotate warning "%s was handed off to %s's new head %s, so its receipt is that run's" "${VERSION}" "${GITHUB_REF_NAME}" "${head}"
             else
-              echo "::error::${VERSION} has no tag, though the root job succeeded"
+              gha_annotate error '%s has no tag, though the root job succeeded' "${VERSION}"
               exit 1
             fi
           elif [ "$GO_RESULT" = "success" ] || [ "$TS_RESULT" = "success" ]; then

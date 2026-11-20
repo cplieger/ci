@@ -33,6 +33,16 @@ jobs:
     outputs:
       matrix: ${{ steps.fanout.outputs.matrix }}
     steps:
+      - name: Checkout ci (for gha-log.sh)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _ci
+          persist-credentials: false
+          sparse-checkout: scripts/gha-log.sh
+          sparse-checkout-cone-mode: false
+
       - name: Discover public repos
         id: fanout
         env:
@@ -42,6 +52,7 @@ jobs:
           ONLY: ${{ github.event.inputs.only }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           # Public only: a private repo's docs have no external readers to
           # protect, and the two private repos check their own links in their
           # bespoke weekly FULL battery. Forks excluded org-wide (a fork's
@@ -59,7 +70,7 @@ jobs:
               case "$wanted" in *" $r "*) filtered="$filtered $r" ;; esac
             done
             repos="$filtered"
-            echo "manual 'only' filter active -> ${repos:-<none matched>}"
+            gha_say "manual 'only' filter active -> %s" "${repos:-<none matched>}"
           fi
 
           # Word-splitting is the point: $repos is a newline/space list built
@@ -105,6 +116,7 @@ jobs:
             scripts/tracker_issue.py
             scripts/trackerlib.py
             scripts/ghrest.py
+            scripts/workflow_commands.py
           sparse-checkout-cone-mode: false
           path: ci
 

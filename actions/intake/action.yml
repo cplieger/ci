@@ -53,6 +53,7 @@ runs:
         SYNC_OWNED: ${{ inputs.sync-owned }}
       run: |
         set -euo pipefail
+        . "$GITHUB_ACTION_PATH/../../scripts/gha-log.sh"
         script="$GITHUB_ACTION_PATH/../../scripts/intake.py"
         (
           case "$CHECK" in
@@ -66,7 +67,7 @@ runs:
               python3 "$script" intake "${args[@]}"
               ;;
             *)
-              echo "::error::intake: unknown check '$CHECK'"
+              gha_annotate error "intake: unknown check '%s'" "$CHECK"
               exit 2
               ;;
           esac

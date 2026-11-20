@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import mutation_cost
+import workflow_commands
 
 if TYPE_CHECKING:
     from string.templatelib import Template
@@ -155,7 +156,7 @@ def discover(repo: str, sha: str, root: Path, only_dir: str, *, honour_opt_out: 
                     'warning',
                     t'{repo}:{dir_}: {OPT_OUT} is not exactly {{"weekly": false}}; mutation-testing the dir anyway',
                 )
-        mutation_cost.say(t'found {repo}:{dir_} @ {sha[:12]}')
+        workflow_commands.say(t'found {repo}:{dir_} @ {sha[:12]}', file=sys.stderr)
         entries.append({'repo': repo, 'sha': sha, 'dir': dir_, 'key': key})
     if only_dir and not (entries or refused or opted):
         raise SystemExit(
@@ -708,7 +709,7 @@ def plan_entry(e: dict, plans_dir: Path, history_dir: Path) -> tuple[dict, list[
         and doc.get('repo') == e['repo']
         and doc.get('dir') == e['dir']
     ):
-        mutation_cost.say(t'{where}: not enrolled, so it does not run')
+        workflow_commands.say(t'{where}: not enrolled, so it does not run', file=sys.stderr)
         return None
     if why := 'no plan' if doc is None else valid_sizing(doc, e):
         return one_job(e, history), [t'{where}: {why}, so it runs in one job']
@@ -747,8 +748,9 @@ def matrix(
         if note := mutation_cost.deadline_note(where, plan):
             mutation_cost.annotate('warning', note, summary=True)
         if plan['workers'] is not None:
-            mutation_cost.say(
-                t'{where}: {plan["shards"]} shard(s), projected {plan["projected_minutes"]} min'
+            workflow_commands.say(
+                t'{where}: {plan["shards"]} shard(s), projected {plan["projected_minutes"]} min',
+                file=sys.stderr,
             )
         k = plan['shards']
         row = {f: e[f] for f in ENTRY_FIELDS}
@@ -1265,7 +1267,7 @@ def merge(plan: dict, shards_dir: Path, stage: Path, costs_out: Path) -> int:
     below = breaking is not None and valid > 0 and detected / valid * 100 < float(breaking)
     (stage / 'below.txt').write_text('true' if below else 'false')
     line = t'{where}: mutation score {score}% over {k} shard(s), {detected} of {valid} detected'
-    mutation_cost.say(line)
+    workflow_commands.say(line, file=sys.stderr)
     mutation_cost.summarize(line)
     return 0
 
@@ -1393,4 +1395,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(mutation_cost.run_main(main))
+    sys.exit(workflow_commands.run_main(main))

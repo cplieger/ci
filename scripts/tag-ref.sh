@@ -7,6 +7,8 @@
 TAG_HANDOFF_PREFIX='release/handoff/'
 # claim_held posts it and claim_unused reads it.
 TAG_CLAIM_PREFIX='release/claim/'
+# shellcheck source=SCRIPTDIR/gha-log.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/gha-log.sh"
 
 # tag_ref <owner/repo> <tag> <commit>: makes refs/tags/<tag> point at <commit>
 # through retry, reading the tag again before each attempt: a release run's lanes
@@ -19,14 +21,14 @@ tag_ref() {
   TAG_CREATED=false TAG_ELSEWHERE=""
   retry tag_ref_once "$1" "$2" "$3" || return 2
   [ -n "$TAG_ELSEWHERE" ] || return 0
-  echo "::error::Tag $2 exists at ${TAG_ELSEWHERE}, not $3. A published version never moves, so nothing is published under it."
+  gha_annotate error 'Tag %s exists at %s, not %s. A published version never moves, so nothing is published under it.' "$2" "${TAG_ELSEWHERE}" "$3"
   return 1
 }
 tag_ref_once() { # <owner/repo> <tag> <commit>
   local at
   if at=$(gh api "repos/$1/git/ref/tags/$2" --jq .object.sha 2>/dev/null); then
     if [ "$at" = "$3" ]; then
-      echo "::notice::Tag $2 already exists at $3, so it is reused"
+      gha_annotate notice 'Tag %s already exists at %s, so it is reused' "$2" "$3"
     else
       TAG_ELSEWHERE=$at
     fi
@@ -62,12 +64,12 @@ tag_ref_or_handoff() {
   head=$(branch_moved_past "$1" "$2" "$4") || mrc=$?
   case "$mrc" in
     0)
-      echo "::warning::tag $3 not created: $2 advanced past $4 (now ${head}), and a superseded run loses ref-create. The run on the new head releases this range."
+      gha_annotate warning 'tag %s not created: %s advanced past %s (now %s), and a superseded run loses ref-create. The run on the new head releases this range.' "$3" "$2" "$4" "${head}"
       handoff_record "$1" "$3" "$4" "the run on ${head}"
       return 2
       ;;
-    1) echo "::error::tag create for $3 failed while this run is still $2's head. It is not a superseded run, so check the token's permissions and the API." ;;
-    *) echo "::error::tag create for $3 failed and $2's head is unreadable, so a handoff cannot be confirmed." ;;
+    1) gha_annotate error "tag create for %s failed while this run is still %s's head. It is not a superseded run, so check the token's permissions and the API." "$3" "$2" ;;
+    *) gha_annotate error "tag create for %s failed and %s's head is unreadable, so a handoff cannot be confirmed." "$3" "$2" ;;
   esac
   return 1
 }
@@ -80,7 +82,7 @@ handoff_record() {
   gh api -X POST "repos/$1/statuses/$3" -f state=success -f context="${TAG_HANDOFF_PREFIX}$2" \
     -f description="$4 releases this commit's changes" \
     -f target_url="${GITHUB_SERVER_URL:-https://github.com}/$1/actions/runs/${GITHUB_RUN_ID:-0}" >/dev/null \
-    || echo "::warning::handoff record for $2 not posted on $3, so only this log names $4 as what releases it."
+    || gha_annotate warning 'handoff record for %s not posted on %s, so only this log names %s as what releases it.' "$2" "$3" "$4"
 }
 
 # later_dev_tag <branch> <tag> <commit>: prints "<tag> <commit>" of a dev tag
@@ -130,11 +132,11 @@ claim_version() {
   at=$(git rev-list -n1 "$3" 2>/dev/null || true)
   if [ "$5" = dev ] && { [ -z "$at" ] || [ "$at" = "$4" ]; }; then
     if ! later=$(later_dev_tag "$2" "$3" "$4"); then
-      echo "::error::git cannot tell whether a later dev tag on $2 holds $4, so $3 is not claimed."
+      gha_annotate error 'git cannot tell whether a later dev tag on %s holds %s, so %s is not claimed.' "$2" "$4" "$3"
       return 1
     fi
     if [ -n "$later" ]; then
-      echo "::notice::${later% *} at ${later#* } already ships the changes of $4, so nothing is published under $3."
+      gha_annotate notice '%s at %s already ships the changes of %s, so nothing is published under %s.' "${later% *}" "${later#* }" "$4" "$3"
       handoff_record "$1" "$3" "$4" "${later% *} at ${later#* }"
       echo "claimed=false" >>"${GITHUB_OUTPUT:?}"
       return 0
@@ -159,24 +161,24 @@ claim_version() {
 claim_held() {
   local later
   if ! retry claim_read "$1" "$3"; then
-    echo "::error::tag $3 cannot be read, so this run's claim of it at $4 is unconfirmed and nothing is published under it."
+    gha_annotate error "tag %s cannot be read, so this run's claim of it at %s is unconfirmed and nothing is published under it." "$3" "$4"
     return 1
   fi
   if [ -z "$CLAIM_AT" ]; then
-    echo "::error::tag $3 does not exist, so nothing is published under it. An attempt that ended before its first write deleted this run's claim: rerun all jobs so the claim job claims it again."
+    gha_annotate error "tag %s does not exist, so nothing is published under it. An attempt that ended before its first write deleted this run's claim: rerun all jobs so the claim job claims it again." "$3"
     return 1
   fi
   if [ "$CLAIM_AT" != "$4" ]; then
-    echo "::error::tag $3 is at ${CLAIM_AT}, not this run's commit $4, so nothing is published under it."
+    gha_annotate error "tag %s is at %s, not this run's commit %s, so nothing is published under it." "$3" "${CLAIM_AT}" "$4"
     return 1
   fi
   if [ "$5" = dev ]; then
     if ! later=$(later_dev_tag "$2" "$3" "$4"); then
-      echo "::error::git cannot tell whether a later dev tag on $2 holds $4, so nothing is published under $3."
+      gha_annotate error 'git cannot tell whether a later dev tag on %s holds %s, so nothing is published under %s.' "$2" "$4" "$3"
       return 1
     fi
     if [ -n "$later" ]; then
-      echo "::notice::${later% *} at ${later#* } already ships the changes of $4, so nothing is published under $3."
+      gha_annotate notice '%s at %s already ships the changes of %s, so nothing is published under %s.' "${later% *}" "${later#* }" "$4" "$3"
       handoff_record "$1" "$3" "$4" "${later% *} at ${later#* }"
       echo "claimed=false" >>"${GITHUB_OUTPUT:?}"
       return 0
@@ -185,7 +187,7 @@ claim_held() {
   if ! retry gh api -X POST "repos/$1/statuses/$4" -f state=success -f context="${TAG_CLAIM_PREFIX}$3" \
     -f description="the release run writes under this claim" \
     -f target_url="${GITHUB_SERVER_URL:-https://github.com}/$1/actions/runs/${GITHUB_RUN_ID:-0}" >/dev/null; then
-    echo "::error::the ${TAG_CLAIM_PREFIX}$3 status was not posted on $4, so nothing is published under $3, which would let the run's end delete it."
+    gha_annotate error "the %s%s status was not posted on %s, so nothing is published under %s, which would let the run's end delete it." "${TAG_CLAIM_PREFIX}" "$3" "$4" "$3"
     return 1
   fi
   echo "claimed=true" >>"${GITHUB_OUTPUT:?}"
@@ -200,26 +202,26 @@ claim_held() {
 claim_unused() {
   local contexts
   if ! retry claim_read "$1" "$2"; then
-    echo "::error::tag $2 cannot be read, so whether this run left an unused claim of it at $3 is unknown."
+    gha_annotate error 'tag %s cannot be read, so whether this run left an unused claim of it at %s is unknown.' "$2" "$3"
     return 1
   fi
   if [ "$CLAIM_AT" != "$3" ]; then
-    echo "::notice::tag $2 is not at $3, so this run holds no claim of it."
+    gha_annotate notice 'tag %s is not at %s, so this run holds no claim of it.' "$2" "$3"
     return 0
   fi
   if ! contexts=$(retry gh api --paginate "repos/$1/commits/$3/statuses?per_page=100" --jq '.[] | select(.state == "success") | .context'); then
-    echo "::error::the statuses of $3 cannot be read, so tag $2 is kept and may be an unused claim: delete refs/tags/$2 when no release run wrote under it."
+    gha_annotate error 'the statuses of %s cannot be read, so tag %s is kept and may be an unused claim: delete refs/tags/%s when no release run wrote under it.' "$3" "$2" "$2"
     return 1
   fi
   if grep -qxF "${TAG_CLAIM_PREFIX}$2" <<<"$contexts"; then
-    echo "::notice::a release run wrote under tag $2 at $3, so the tag stays."
+    gha_annotate notice 'a release run wrote under tag %s at %s, so the tag stays.' "$2" "$3"
     return 0
   fi
   if ! retry gh api -X DELETE "repos/$1/git/refs/tags/$2" >/dev/null; then
-    echo "::error::tag $2 at $3 has nothing written under it, and GitHub refused its delete. Delete refs/tags/$2 by hand: until then it stands as an unproven claim of a version never published."
+    gha_annotate error 'tag %s at %s has nothing written under it, and GitHub refused its delete. Delete refs/tags/%s by hand: until then it stands as an unproven claim of a version never published.' "$2" "$3" "$2"
     return 1
   fi
-  echo "::notice::nothing was written under tag $2, so this run's claim of it is deleted."
+  gha_annotate notice "nothing was written under tag %s, so this run's claim of it is deleted." "$2"
 }
 
 # claim_read <owner/repo> <tag>: CLAIM_AT is the tag's commit, empty when
@@ -245,7 +247,7 @@ untagged_handed_off() {
   local head rc=0
   head=$(branch_moved_past "$1" "$2" "$4") || rc=$?
   [ "$rc" -eq 0 ] || return "$rc"
-  echo "::warning::$3 is not tagged at $4 and $2 advanced past it (now ${head}), so the run on the new head releases it."
+  gha_annotate warning '%s is not tagged at %s and %s advanced past it (now %s), so the run on the new head releases it.' "$3" "$4" "$2" "${head}"
 }
 
 # root_handed_off <owner/repo> <branch> <version> <commit> <channel>: for a job
@@ -262,7 +264,7 @@ root_handed_off() {
   [ "$5" = dev ] || return 1
   later=$(later_dev_tag "$2" "$3" "$4") || return 2
   [ -n "$later" ] || return 1
-  echo "::warning::$3 at $4 was handed off to ${later% *} at ${later#* }, which ships its changes."
+  gha_annotate warning '%s at %s was handed off to %s at %s, which ships its changes.' "$3" "$4" "${later% *}" "${later#* }"
   return 0
 }
 
@@ -284,7 +286,7 @@ package_handed_off() {
   later=$(later_dev_tag "$2" "$3" "$4") || return 2
   [ -n "$later" ] || return 1
   dev=$(npm_dev_above "$6" "${ver#v}") || return
-  echo "::warning::$(jq -r .name "$6") is not published at $3: npm's dev dist-tag already names ${dev}, and ${later% *} at ${later#* } holds $4."
+  gha_annotate warning "%s is not published at %s: npm's dev dist-tag already names %s, and %s at %s holds %s." "$(jq -r .name "$6")" "$3" "${dev}" "${later% *}" "${later#* }" "$4"
 }
 
 # npm_dev_above <package.json> <X.Y.Z-dev.N>: prints npm's dev dist-tag of the

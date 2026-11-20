@@ -418,13 +418,13 @@ for f in derive modpath promote buildargs; do
   chk "D-P3 $f parses under bash" "$(bash -n "$WORK/$f.sh" 2>/dev/null && echo ok || echo bad)" "ok"
 done
 chk "D-P4 derive reads the four inputs" "$(tr '\n' ' ' <"$WORK/derive.sh.env")" \
-  "CHANNEL DEV_VERSION RELEASE_NEEDED VERSION_INPUT "
+  "CHANNEL CI_TOOLS DEV_VERSION RELEASE_NEEDED VERSION_INPUT "
 chk "D-P4 the caller check reads the event's repository alone" "$(cat "$WORK/caller.sh.envmap" | tr '\n' ' ')" \
-  'DEFAULT_BRANCH=${{ github.event.repository.default_branch }} REPO_FORK=${{ github.event.repository.fork }} REPO_PRIVATE=${{ github.event.repository.private }} '
+  'CI_TOOLS=${{ github.workspace }}/.cplieger-ci/scripts DEFAULT_BRANCH=${{ github.event.repository.default_branch }} REPO_FORK=${{ github.event.repository.fork }} REPO_PRIVATE=${{ github.event.repository.private }} '
 chk "D-P5 promote reads the exclusion list and the subpackages" "$(tr '\n' ' ' <"$WORK/promote.sh.env")" "CI_TOOLS EXCLUDE_RE SUBPACKAGES_JSON "
 chk "D-P5 the subpackages are the caller's declared list" "$(sed -n 's/^SUBPACKAGES_JSON=//p' "$WORK/promote.sh.envmap")" '${{ inputs.subpackages }}'
 chk_has "D-P5 promote runs the shared digest resolver" "$(cat "$WORK/promote.sh")" 'bash "$CI_TOOLS/promote-digest.sh" "$GITHUB_SHA"'
-chk "D-P6 build args read the channel tag, in prepare" "$(tr '\n' ' ' <"$WORK/buildargs.sh.env")" "DOCKERFILE TAG "
+chk "D-P6 build args read the channel tag, in prepare" "$(tr '\n' ' ' <"$WORK/buildargs.sh.env")" "CI_TOOLS DOCKERFILE TAG "
 # The extracted body sees only the TAG variable; what feeds it is an
 # expression the shell cannot evaluate, so it is pinned by text: the channel
 # tag prepare derived, never the stable base a dev build has not earned.
@@ -451,7 +451,7 @@ chk "D-P9 the inputs carry the kind line and the security merges, no promotion n
 chk "D-P10 the workflow says nothing of a soak" "$(gate '.soak')" "0"
 policy_keys() { # <repo name> <spdx id> -> the policy step's output keys
   : >"$WORK/policy-out"
-  (cd "$WORK" && REPO_NAME="$1" REPO_SPDX_ID="$2" GITHUB_OUTPUT="$WORK/policy-out" bash "$WORK/policy.sh") >/dev/null
+  (cd "$WORK" && CI_TOOLS="$ROOT/scripts" REPO_NAME="$1" REPO_SPDX_ID="$2" GITHUB_OUTPUT="$WORK/policy-out" bash "$WORK/policy.sh") >/dev/null
   sed 's/=.*//' "$WORK/policy-out" | tr '\n' ' '
 }
 chk "D-P11 every release SBOM scan reads the published image" "$(gate '."sbom-sources" | join(",")')" "image"
@@ -463,7 +463,7 @@ chk "D-P11 the policy hands every image repository the same keys" \
   "registries platforms syft_config image_licenses runner_image_licenses binaries /registries platforms syft_config image_licenses runner_image_licenses binaries /registries platforms syft_config image_licenses runner_image_licenses binaries "
 policy_value() { # <repo name> <key> -> that key's value from the policy step
   : >"$WORK/policy-out"
-  (cd "$WORK" && REPO_NAME="$1" REPO_SPDX_ID=Apache-2.0 GITHUB_OUTPUT="$WORK/policy-out" bash "$WORK/policy.sh") >/dev/null
+  (cd "$WORK" && CI_TOOLS="$ROOT/scripts" REPO_NAME="$1" REPO_SPDX_ID=Apache-2.0 GITHUB_OUTPUT="$WORK/policy-out" bash "$WORK/policy.sh") >/dev/null
   sed -n "s/^$2=//p" "$WORK/policy-out"
 }
 chk "D-P12 grelot's Release carries its client as binaries, and no other repository's does" \
@@ -676,9 +676,9 @@ for ref in refs/heads/feature/probe refs/tags/v1.2.3 refs/pull/7/merge ""; do
   chk "D-V12 failing the step on '${ref:-<unset>}', having written no output" \
     "$(tail -n1 <<<"$said")|$(wc -c <"$WORK/out" | tr -d ' ')" "EXIT=1|0"
 done
-chk "D-V12 the check runs in both modes, first, holding no scope" \
+chk "D-V12 the check runs in both modes, first, holding only the checkout's read" \
   "$(gate '."caller-if"')|$(gate '."caller-needs"')|$(gate '."caller-perms" | tojson')|$(gate '."caller-steps" | join(",")')" \
-  "|null|{}|Refuse a caller outside the two-branch model"
+  '|null|{"contents":"read"}|Check out the ci source,Refuse a caller outside the two-branch model'
 chk "D-V12 and both modes need it" "$(gate '."prepare-needs"')|$(gate '."ra-needs"')" "caller|caller"
 chk "D-V12 so a refused release call starts nothing after it" "$(gate '."release-call-runs-refused" | join(" ")')" "caller"
 chk "D-V12 nor does a refused repair call" "$(gate '."repair-call-runs-refused" | join(" ")')" "caller"
@@ -698,7 +698,7 @@ out_mod=$(modpath_in 'module github.com/owner/app')
 chk "D-M2 the plain repository path passes" "$(printf '%s' "$out_mod" | grep -c '^EXIT=' || true)" "0"
 out_mod=$(modpath_in 'module github.com/owner/app/v4')
 chk "D-M3 a /vN suffix fails" "$(printf '%s' "$out_mod" | sed -n 's/^EXIT=//p')" "1"
-chk_has "D-M3 the /vN error names the fix" "$out_mod" "drop the /vN suffix from go.mod and rewrite internal imports; apps use the plain module path"
+chk_has "D-M3 the /vN error names the fix" "$out_mod" "drop the /vN suffix from go.mod and rewrite internal imports. Apps use the plain module path"
 out_mod=$(modpath_in 'module github.com/owner/other')
 chk "D-M4 another repository's path fails" "$(printf '%s' "$out_mod" | sed -n 's/^EXIT=//p')" "1"
 chk_has "D-M4 the error names the expected path" "$out_mod" "must be 'github.com/owner/app'"
@@ -1252,7 +1252,7 @@ fresh_tools() {
 fresh_tools
 printf 'echo "::error::path-significance: boom" >&2\nexit 2\n' >"$G_TOOLS/path-significance.sh"
 chk "D-RG9 paths that cannot be classified publish as usual, naming why" \
-  "$(SCOPE_TOOLS="$G_TOOLS" CHANNEL=dev scope_at "$G_DEV")|$(said)|$(grep -cx 'path-significance: boom' "$WORK/scope.err")" \
+  "$(SCOPE_TOOLS="$G_TOOLS" CHANNEL=dev scope_at "$G_DEV")|$(said)|$(grep -cx -- '- path-significance: boom' "$WORK/scope.err")" \
   "0|false||::warning::The paths changed since v1.3.0-dev.2 could not be classified, so this release publishes as usual.~|1"
 fresh_tools
 printf 'exit 1\n' >"$G_TOOLS/render-notes.sh"
@@ -1304,7 +1304,7 @@ chk "D-RG17 with the caller's inputs and the ci source" "$(tr '\n' ' ' <"$WORK/s
   'CHANNEL=${{ inputs.channel }} CI_TOOLS=${{ github.workspace }}/.cplieger-ci/scripts GO_LANES_JSON=${{ inputs.go-modules }} PLATFORMS=${{ inputs.platforms }} SUBPACKAGES_JSON=${{ inputs.subpackages }} VERSION=${{ inputs.version }} '
 chk "D-RG17 after that source, the digest walk and the build args, before the metadata" \
   "$(gate '."scope-after" | join(",")')|$(gate '."scope-before-meta"')" "Check out the ci source,Resolve promoted digest,Resolve build args|true"
-chk "D-RG17 the ci source is checked out on both channels" "$(gate '."prepare-src-if"')" "\${{ steps.tags.outputs.publish == 'true' }}"
+chk "D-RG17 the ci source is checked out on both channels, whatever the run publishes" "$(gate '."prepare-src-if"')" ""
 chk "D-RG17 prepare hands the decision on" "$(gate '."prepare-outputs" | "\(.rebuild_only)|\(.compare_tag)"')" \
   '${{ steps.rebuild.outputs.rebuild_only }}|${{ steps.rebuild.outputs.compare_tag }}'
 gstep() { jq -c --arg n "$1" ".gate.steps[] | select(.name == \$n) | $2" "$WORK/gates.json"; }
@@ -2122,7 +2122,7 @@ chmod 755 "$SBIN/docker"
 # The step's metadata file is a fixed /tmp path; the probe keeps it in WORK.
 sed "s|/tmp/manifest-meta.json|$WORK/manifest-meta.json|g" "$WORK/manifest.sh" >"$WORK/manifest-local.sh"
 grep -q "$WORK/manifest-meta.json" "$WORK/manifest-local.sh" || fail "D-PS6 the channel-tag step no longer writes /tmp/manifest-meta.json"
-(cd "$WORK" && PATH="$SBIN:$PATH" REGISTRY=ghcr.io IMAGE_NAME=owner/app PROMOTE_DIGEST="$D_P" VERSION=2.1.0 MINOR=2.1 MAJOR=2 TAGS='' \
+(cd "$WORK" && PATH="$SBIN:$PATH" CI_TOOLS="$ROOT/scripts" REGISTRY=ghcr.io IMAGE_NAME=owner/app PROMOTE_DIGEST="$D_P" VERSION=2.1.0 MINOR=2.1 MAJOR=2 TAGS='' \
   GITHUB_OUTPUT="$WORK/manifest-out" bash "$WORK/manifest-local.sh") >/dev/null 2>&1 || fail "D-PS6 the channel-tag step failed on a promotion"
 chk "D-PS6 a promotion's channel tags report built=false, so the scan, gated on built, is skipped" \
   "$(sed -n 's/^built=//p' "$WORK/manifest-out")|$(gate '."scan-ifs" | join(",")')" \
@@ -2818,7 +2818,7 @@ done
 out_l=$(DOCKER_FAILS=1 login docker-release-finalize-hub ghcr.io)
 chk "D-L3 a login that hits one reset connection succeeds on its second attempt" \
   "$(wc -l <"$DOCKER_LOG" | tr -d ' ')|$(printf '%s' "$out_l" | grep -c '^EXIT=' || true)" "2|0"
-chk_has "D-L3 and warns about the retry in the legacy words" "$out_l" "::warning::login_once attempt 1/5 failed; retrying in 5s"
+chk_has "D-L3 and warns about the retry" "$out_l" "::warning::login_once attempt 1/5 failed, so it is retried in 5s"
 chk "D-L3 Docker Hub is docker.io, the password on stdin and never in argv" "$(tail -1 "$DOCKER_LOG")" \
   "login --username probe-user --password-stdin docker.io | stdin=probe-secret"
 out_l=$(DOCKER_FAILS=1 login docker-release-build-ghcr ghcr.io)
@@ -2847,11 +2847,11 @@ chk "D-IT4 it reads the digest artifact the amd64 build leg uploads" \
 mkdir -p "$WORK/it/digests"
 printf 'sha256:%064d\n' 7 >"$WORK/it/digests/linux-amd64"
 : >"$WORK/it/out"
-(RUNNER_TEMP="$WORK/it" GITHUB_OUTPUT="$WORK/it/out" REGISTRY=ghcr.io IMAGE_NAME=probe/app bash "$WORK/image-ref.sh")
+(CI_TOOLS="$ROOT/scripts" RUNNER_TEMP="$WORK/it" GITHUB_OUTPUT="$WORK/it/out" REGISTRY=ghcr.io IMAGE_NAME=probe/app bash "$WORK/image-ref.sh")
 chk "D-IT5 the reference names the registry, the image and the pushed digest" "$(cat "$WORK/it/out")" \
   "ref=ghcr.io/probe/app@sha256:$(printf '%064d' 7)"
 printf 'not-a-digest\n' >"$WORK/it/digests/linux-amd64"
-out_it=$( (RUNNER_TEMP="$WORK/it" GITHUB_OUTPUT="$WORK/it/out2" REGISTRY=ghcr.io IMAGE_NAME=probe/app bash "$WORK/image-ref.sh" 2>&1) || echo "EXIT=$?")
+out_it=$( (CI_TOOLS="$ROOT/scripts" RUNNER_TEMP="$WORK/it" GITHUB_OUTPUT="$WORK/it/out2" REGISTRY=ghcr.io IMAGE_NAME=probe/app bash "$WORK/image-ref.sh" 2>&1) || echo "EXIT=$?")
 chk_has "D-IT5 an artifact that holds no digest fails the job" "$out_it" "EXIT=1"
 chk "D-IT6 both tests take that reference" \
   "$(gate '."image-test"."Image smoke test".ref')|$(gate '."image-test"."Image test suite".ref')" \

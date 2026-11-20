@@ -81,7 +81,7 @@ class ReadFixture(Harness):
         self.assertEqual(
             self.STEP['env']['PACKAGE'], '${{ inputs.working-directory }}/package.json'
         )
-        self.assertEqual(self.STEP['run'], 'node -e "$READ_FIXTURE"')
+        self.assertIn('{ why=$(node -e "$READ_FIXTURE" 2>&1 >&3); } 3>&1', self.STEP['run'])
 
     def test_a_package_without_the_field_builds_nothing(self):
         for manifest in ({'name': 'x'}, {'cplieger': {'vitestShards': 2}}, [], 'x', None):
@@ -247,6 +247,7 @@ class BuildFixture(Harness):
         self.assertEqual(
             self.STEP['env'],
             {
+                'CI_TOOLS': '${{ runner.temp }}/cplieger-ci/scripts',
                 'FIXTURE_DIR': '${{ needs.package.outputs.sse-fixture }}',
                 'FIXTURE_TAGS': '${{ needs.package.outputs.sse-fixture-tags }}',
             },

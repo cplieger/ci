@@ -39,6 +39,7 @@ from pathlib import Path
 import ghrest
 import inventory
 import release_channels as rc
+import workflow_commands
 from purity import PurityInputError, first_party, lane_holds, purity_violations, tree_files
 
 OWNER = 'cplieger'
@@ -137,7 +138,7 @@ def write_summary(text: str) -> None:
     if path:
         with open(path, 'a') as fh:
             fh.write(text)
-    print(text, end='')
+    workflow_commands.say_lines(text)
 
 
 def write_outputs(values: dict[str, str]) -> None:
@@ -146,7 +147,7 @@ def write_outputs(values: dict[str, str]) -> None:
     if path:
         with open(path, 'a') as fh:
             fh.write(lines)
-    print(lines, end='')
+    workflow_commands.say_lines(lines)
 
 
 def token_free_env(**extra: str) -> dict[str, str]:
@@ -330,8 +331,8 @@ def check_digest(
                 'signing). Rebuild on dev and promote the new head'
             )
         ]
-    print(
-        f'image: re-tags {digest} built at {out.get("promote_source", "")[:12]} ({out.get("promote_via")})'
+    workflow_commands.say(
+        t'image: re-tags {digest} built at {out.get("promote_source", "")[:12]} ({out.get("promote_via")})'
     )
     return digest, []
 
@@ -395,7 +396,7 @@ def check_dominance(
     except inventory.InventoryError as exc:
         return [f'dominance: uncomparable: {exc}']
     if result['verdict'] == 'pass':
-        print(inventory.render_dominance(result))
+        workflow_commands.say_lines(inventory.render_dominance(result))
         return []
     lines = inventory.render_dominance(result).splitlines()
     return [
@@ -631,7 +632,7 @@ def check_vulnerabilities(
         )
         return [refusal]
     if package != repo:
-        print(f"image: main's {tag} is {REGISTRY}/{OWNER}/{package}@{main_digest}")
+        workflow_commands.say(t"image: main's {tag} is {REGISTRY}/{OWNER}/{package}@{main_digest}")
     ours, theirs = platforms(repo, digest, token), platforms(package, main_digest, main_token)
     if (SINGLE_MANIFEST in ours) != (SINGLE_MANIFEST in theirs):
         shape = {True: 'one manifest', False: 'a multi-platform index'}
@@ -655,7 +656,9 @@ def check_vulnerabilities(
         )
         for vid, pkg in sorted(new - old):
             if vid in accepted:
-                print(f'image {plat}: {vid} in {pkg} accepted (accept_vulnerabilities)')
+                workflow_commands.say(
+                    t'image {plat}: {vid} in {pkg} accepted (accept_vulnerabilities)'
+                )
                 continue
             found.append(
                 f"image {plat}: {vid} in {pkg} is fixable and absent from main's {tag}. "
@@ -773,26 +776,37 @@ def cmd_snapshot(args) -> int:
     try:
         refusal = enrolment_refusal(args.repo)
         if refusal:
-            print(f'::error::refused: {refusal}', file=sys.stderr)
+            print(workflow_commands.command('error', f'refused: {refusal}'), file=sys.stderr)
             return 1
         clone = clone_repo(args.repo, Path(args.work_dir) / f'{args.repo}.git', bare=True)
         main = branch_head(clone, 'main', bare=True)
         target = branch_head(clone, 'dev', bare=True)
         if args.target:
             if not TARGET_RE.fullmatch(args.target):
-                print(f'::error::refused: {args.target!r} is not a commit SHA', file=sys.stderr)
+                print(
+                    workflow_commands.command(
+                        'error', f'refused: {args.target!r} is not a commit SHA'
+                    ),
+                    file=sys.stderr,
+                )
                 return 1
             target = git(clone, 'rev-parse', '--verify', f'{args.target}^{{commit}}').strip()
     except GhError as err:
-        print(f'::error::{err}', file=sys.stderr)
+        print(workflow_commands.command('error', err), file=sys.stderr)
         return 1
     if not on_dev_first_parent(clone, target, bare=True):
         print(
-            f'::error::refused: {target} is not on the first-parent history of dev', file=sys.stderr
+            workflow_commands.command(
+                'error', f'refused: {target} is not on the first-parent history of dev'
+            ),
+            file=sys.stderr,
         )
         return 1
     if git(clone, 'merge-base', target, main).strip() == target:
-        print(f'::error::refused: {target[:12]} is already part of main', file=sys.stderr)
+        print(
+            workflow_commands.command('error', f'refused: {target[:12]} is already part of main'),
+            file=sys.stderr,
+        )
         return 1
     # preview plans each lane against main's stable tags and check_vulnerabilities reads
     # M's stable image, so a release of M still running would leave both reading too early.
@@ -800,10 +814,13 @@ def cmd_snapshot(args) -> int:
         committed = datetime.fromisoformat(git(clone, 'log', '-1', '--format=%cI', main).strip())
         waited = wait_for_main_release(args.repo, main, committed)
     except GhError as err:
-        print(f'::error::{err}', file=sys.stderr)
+        print(workflow_commands.command('error', err), file=sys.stderr)
         return 1
     if waited:
-        print(f'::error::refused: {waited}, so rerun once it finishes', file=sys.stderr)
+        print(
+            workflow_commands.command('error', f'refused: {waited}, so rerun once it finishes'),
+            file=sys.stderr,
+        )
         return 1
     write_outputs({'repo': args.repo, 'target': target, 'main': main})
     write_summary(
@@ -1017,13 +1034,15 @@ def cmd_preview(args) -> int:
                     '',
                 ]
     except (GhError, inventory.InventoryError) as err:
-        print(f'::error::preview: {err}', file=sys.stderr)
+        print(workflow_commands.command('error', f'preview: {err}'), file=sys.stderr)
         return 1
     write_summary('\n'.join(lines) + '\n')
     # Printed after every tool that ran the repository's cliff config, so the
     # last line of this shape in the log is this one.
     versions = {key: lane['version'] for key, lane in plan.items()}
-    print('release-plan: ' + json.dumps(versions, sort_keys=True, separators=(',', ':')))
+    workflow_commands.say(
+        t'release-plan: {json.dumps(versions, sort_keys=True, separators=(",", ":"))}'
+    )
     return 0
 
 
@@ -1064,11 +1083,19 @@ def cmd_check(args) -> int:
     if not REPO_RE.fullmatch(args.repo) or not all(
         FULL_SHA_RE.fullmatch(s) for s in (args.main, args.target)
     ):
-        print('::error::check needs a repository name and two full commit SHAs', file=sys.stderr)
+        print(
+            workflow_commands.command(
+                'error', 'check needs a repository name and two full commit SHAs'
+            ),
+            file=sys.stderr,
+        )
         return 2
     accepted = frozenset(args.accept_vulnerabilities.replace(',', ' ').split())
     if bad := sorted(v for v in accepted if not VULN_ID_RE.fullmatch(v)):
-        print(f'::error::not a vulnerability ID: {", ".join(bad)}', file=sys.stderr)
+        print(
+            workflow_commands.command('error', f'not a vulnerability ID: {", ".join(bad)}'),
+            file=sys.stderr,
+        )
         return 2
     try:
         clone = clone_repo(args.repo, work / f'{args.repo}.git', bare=True)
@@ -1096,7 +1123,7 @@ def cmd_check(args) -> int:
         lines += [f'- {r}' for r in refusals]
         write_summary('\n'.join(lines) + '\n')
         for r in refusals:
-            print(f'::error::{r}', file=sys.stderr)
+            print(workflow_commands.command('error', r), file=sys.stderr)
         return 1
     Path(args.plan_file).write_text(
         json.dumps({'repo': args.repo, 'digest': digest, **plan}, indent=2) + '\n'
@@ -1141,7 +1168,7 @@ def cmd_create(args) -> int:
         )
         verify_created(created, plan)
     except GhError as err:
-        print(f'::error::{repo}: {err}', file=sys.stderr)
+        print(workflow_commands.command('error', f'{repo}: {err}'), file=sys.stderr)
         return 1
     write_outputs({'r': created['sha'], 'digest': plan.get('digest', '')})
     return 0
@@ -1172,17 +1199,27 @@ def cmd_tag(args) -> int:
         and DIGEST_RE.fullmatch(args.digest)
         and FULL_SHA_RE.fullmatch(args.r)
     ):
-        print('::error::tag needs a repository name, a sha256 digest and R', file=sys.stderr)
+        print(
+            workflow_commands.command(
+                'error', 'tag needs a repository name, a sha256 digest and R'
+            ),
+            file=sys.stderr,
+        )
         return 2
     credential = os.environ.get('GHCR_TOKEN', '')
     if not credential:
-        print('::error::tag needs GHCR_TOKEN', file=sys.stderr)
+        print(workflow_commands.command('error', 'tag needs GHCR_TOKEN'), file=sys.stderr)
         return 2
     tag = promoted_tag(args.r)
     try:
         push_tag(args.repo, args.digest, tag, credential)
     except GhError as err:
-        print(f'::error::{args.repo}: {err}. The main branch did not move.', file=sys.stderr)
+        print(
+            workflow_commands.command(
+                'error', f'{args.repo}: {err}. The main branch did not move.'
+            ),
+            file=sys.stderr,
+        )
         return 1
     write_summary(f'## Tagged\n\n`{REGISTRY}/{OWNER}/{args.repo}:{tag}` = `{args.digest}`.\n')
     return 0
@@ -1218,7 +1255,9 @@ def cmd_move(args) -> int:
         and (not args.digest or DIGEST_RE.fullmatch(args.digest))
     ):
         print(
-            '::error::move needs a repository name, three full SHAs and a digest or none',
+            workflow_commands.command(
+                'error', 'move needs a repository name, three full SHAs and a digest or none'
+            ),
             file=sys.stderr,
         )
         return 2
@@ -1231,7 +1270,7 @@ def cmd_move(args) -> int:
             {'sha': args.r, 'force': False},
         )
     except (GhError, KeyError, TypeError) as err:
-        print(f'::error::{repo}: {err}', file=sys.stderr)
+        print(workflow_commands.command('error', f'{repo}: {err}'), file=sys.stderr)
         return 1
     write_summary(
         f'## Promoted\n\n**{repo}**: main -> `{args.r[:12]}` (dev `{args.target[:12]}`).\n'

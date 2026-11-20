@@ -31,6 +31,8 @@ import re
 import sys
 from pathlib import Path
 
+import workflow_commands
+
 _spec = importlib.util.spec_from_file_location(
     'gremlins_merge', Path(__file__).with_name('gremlins-merge.py')
 )
@@ -139,15 +141,17 @@ def main() -> int:
         (args.target / d / '.gremlins.yaml').write_text(
             scoped_config(central, d, candidates, others)
         )
-        print(f'[{d}] .gremlins.yaml excludes nested modules: {inner or "none"}', file=sys.stderr)
+        workflow_commands.say(
+            t'[{d}] .gremlins.yaml excludes nested modules: {inner or "none"}', file=sys.stderr
+        )
         if plan:
-            print(
-                f'[{d}] shard {args.shard} of {plan["shards"]} also excludes '
-                f'{len(others)} file(s) other shards mutate',
+            workflow_commands.say(
+                t'[{d}] shard {args.shard} of {plan["shards"]} also excludes '
+                t'{len(others)} file(s) other shards mutate',
                 file=sys.stderr,
             )
     return 0
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(workflow_commands.run_main(main))

@@ -18,17 +18,15 @@ import math
 import os
 import re
 import sys
-import traceback
 from dataclasses import dataclass, field
-from string.templatelib import Template, convert
 from typing import TYPE_CHECKING, NamedTuple
 
-if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
-    from pathlib import Path
+import workflow_commands
 
-# Every plain log line starts with this, so the runner never reads one as a command.
-SAY_PREFIX = '- '
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+    from pathlib import Path
+    from string.templatelib import Template
 
 # The bar a sharded run meets (bar_faults): the run's measured time within BAND of
 # its projection, no shard more than BAND over its own, and every job, slowest
@@ -381,19 +379,8 @@ def deadline_note(where: str, plan: object) -> Template | None:
     )
 
 
-def escape_data(s: str) -> str:
-    """S as an annotation's message, escaped as the Actions toolkit's escapeData does."""
-    return s.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-
-
-def _plain(s: str) -> str:
-    # The runner also reads `##[command]` anywhere in a line that is not a `::` command
-    # (actions/runner ActionCommand.TryParse), and a plain line is never unescaped.
-    return escape_data(s).replace('#', '%23')
-
-
 def _code_span(s: str) -> str:
-    s = escape_data(s)
+    s = workflow_commands.escape_data(s)
     if not s:
         return ''
     fence = '`' * (max((len(r) for r in re.findall('`+', s)), default=0) + 1)
@@ -401,52 +388,13 @@ def _code_span(s: str) -> str:
     return f'{fence}{pad}{s}{pad}{fence}'
 
 
-def render(msg: Template, quote: Callable[[str], str] = str) -> str:
-    """MSG's text, each interpolated value passed through QUOTE and each literal part kept.
-
-    A t-string's literal parts are what the script wrote and its values are
-    data, so this is the one place target-written text gets its escaping.
-    """
-    if not isinstance(msg, Template):
-        raise TypeError(f'a log line is a t-string, not {type(msg).__name__}')
-    out = []
-    for part in msg:
-        if isinstance(part, str):
-            out.append(part)
-        elif isinstance(part.value, Template):
-            out.append(render(part.value, quote))
-        else:
-            out.append(quote(format(convert(part.value, part.conversion), part.format_spec)))
-    return ''.join(out)
-
-
-def say(msg: Template) -> None:
-    """Log MSG as a plain line: it starts with SAY_PREFIX, so no value it holds starts a workflow command."""
-    print(SAY_PREFIX + render(msg, _plain), file=sys.stderr)
-
-
 def annotate(kind: str, msg: Template, *, summary: bool = False) -> None:
     """Write MSG as a KIND annotation, and to the run summary too when SUMMARY."""
     if kind not in ('notice', 'warning', 'error'):
         raise ValueError(f'{kind!r} is not an annotation')
-    print(f'::{kind}::{render(msg, escape_data)}', file=sys.stderr)
+    print(workflow_commands.command(kind, workflow_commands.render(msg)), file=sys.stderr)
     if summary:
         summarize(msg)
-
-
-def run_main(main: Callable[[], int]) -> int:
-    """MAIN's exit code, with an uncaught error logged through say, so its text starts no command."""
-    try:
-        return main()
-    except SystemExit as exc:
-        if exc.code is None or isinstance(exc.code, int):
-            return exc.code or 0
-        annotate('error', t'{exc.code}')
-        return 1
-    except Exception:
-        for line in traceback.format_exc().splitlines():
-            say(t'{line}')
-        return 1
 
 
 def summarize(msg: Template, *, table: bool = False) -> None:
@@ -456,9 +404,9 @@ def summarize(msg: Template, *, table: bool = False) -> None:
     """
     if path := os.environ.get('GITHUB_STEP_SUMMARY'):
         line = (
-            render(msg, lambda v: _code_span(v).replace('|', '\\|'))
+            workflow_commands.render(msg, lambda v: _code_span(v).replace('|', '\\|'))
             if table
-            else f'### {render(msg, _code_span)}'
+            else f'### {workflow_commands.render(msg, _code_span)}'
         )
         with open(path, 'a') as f:
             f.write(line + '\n')
@@ -658,7 +606,7 @@ def note_prior_error(where: str, measured: float | None) -> None:
     if measured is None:
         return
     line = t'{where}: prior-priced work took up to {measured}x its prior in one shard this week'
-    say(line)
+    workflow_commands.say(line, file=sys.stderr)
     summarize(line)
     if measured > PRIOR_ERROR:
         annotate(
@@ -734,4 +682,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(run_main(main))
+    sys.exit(workflow_commands.run_main(main))

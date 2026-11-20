@@ -83,16 +83,27 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.CI_SCHEDULE }}
     steps:
+      - name: Checkout ci (for gha-log.sh)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _ci
+          persist-credentials: false
+          sparse-checkout: scripts/gha-log.sh
+          sparse-checkout-cone-mode: false
+
       - name: Trigger security.yml on cplieger/${{ matrix.repo }}
         if: ${{ !matrix.ref }}
         env:
           REPO: ${{ matrix.repo }}
         run: |
           set -euo pipefail
+          . "$GITHUB_WORKSPACE/_ci/scripts/gha-log.sh"
           # gh resolves a missing --ref over GraphQL, whose quota every token of
           # the account owner shares; REST names the default branch instead.
           ref=$(gh api "repos/cplieger/${REPO}" --jq .default_branch)
-          [ -n "$ref" ] || { echo "::error::cplieger/${REPO} reports no default branch"; exit 1; }
+          [ -n "$ref" ] || { gha_annotate error 'cplieger/%s reports no default branch' "${REPO}"; exit 1; }
           gh workflow run security.yml -R "cplieger/${REPO}" --ref "$ref"
 
       - name: Trigger security.yml on cplieger/${{ matrix.repo }} at ${{ matrix.ref }}

@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 import mutation_cost
+import workflow_commands
 
 _spec = importlib.util.spec_from_file_location(
     'stryker_aggregate', Path(__file__).with_name('stryker-aggregate.py')
@@ -393,7 +394,7 @@ def fleet(tool: str, keys_json: str, results: Path) -> int:
             t'| {key} | {outcome} | {shards} | {untested:.2000} | {why:.2000} |', table=True
         )
     for key, outcome, *_ in rows:
-        mutation_cost.say(t'{key}: {outcome}')
+        workflow_commands.say(t'{key}: {outcome}', file=sys.stderr)
     if not rows:
         mutation_cost.annotate('error', t'{tool}: the run named no call, so it tested nothing')
     return 0 if rows and all(r[1] in GREEN for r in rows) else 1
@@ -446,4 +447,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(mutation_cost.run_main(main))
+    sys.exit(workflow_commands.run_main(main))

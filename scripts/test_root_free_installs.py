@@ -202,6 +202,7 @@ class InstallSteps(unittest.TestCase):
             'GITHUB_PATH': str(tmp / 'github_path'),
             'FIXTURES': str(fixtures),
             'STUB_LOG': str(tmp / 'log'),
+            'CI_TOOLS': str(ROOT / 'scripts'),
         }
         proc = subprocess.run(
             ['bash', '-e', str(script)], cwd=tmp, env=env, capture_output=True, text=True
