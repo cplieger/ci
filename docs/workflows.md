@@ -68,19 +68,21 @@ The jobs that move install their tools into `$RUNNER_TEMP/bin` with no `sudo`, a
 
 | Workflow | What it runs |
 | --- | --- |
-| `go-ci.yaml` | `go vet`, golangci-lint, `go test -race`, `go vet`, golangci-lint and `go test` again under `-tags noui` when that tag changes the module's build, govulncheck, `go mod verify`, a wiregen drift check, dependency review on public pull requests |
+| `go-ci.yaml` | `go vet`, golangci-lint, `go test -race`, `go vet`, golangci-lint and `go test` again under `-tags noui` when that tag changes the module's build, the same three under the tags a module's `.go-test-tags` names, govulncheck, `go mod verify`, a wiregen drift check, dependency review on public pull requests |
 | `go-os-ci.yaml` | on the `runner` input's Windows or macOS runner: `go vet`, golangci-lint, `go test -race`, and `go vet` for Linux, macOS and Windows on amd64 and arm64 |
 | `ts-ci.yaml` | `npm ci`, ESLint, `tsc`, knip for import cycles and undeclared dependencies, vitest (after building the Go test server a package names in `sseFixture`), fast-check fuzz tests, Prettier, `package.json` and `jsr.json` version parity, a publish-surface check, dependency review |
 | `ts-ci.yaml` with `web-lint: true` | the above, plus Stylelint, html-validate and an import-map coverage check |
 | `shell-ci.yaml` | shellcheck, shfmt, hadolint on the `dockerfile` input and every `images/<name>/Dockerfile` unless the input is empty, and `tests/shell/run.sh` when the repository has one |
 
-`ci.yaml`, `go-ci.yaml` and `go-os-ci.yaml` take a `go-test-timeout` input, empty by default. It is the `-timeout` of `go test -race`, and in `go-ci.yaml` of the `noui` tests too. Set it to a Go duration such as `20m` for a module whose test binaries run longer than the go command's default of 10 minutes each.
+`ci.yaml`, `go-ci.yaml` and `go-os-ci.yaml` take a `go-test-timeout` input, empty by default. It is the `-timeout` of `go test -race`, and in `go-ci.yaml` of the `noui` and `.go-test-tags` tests too. Set it to a Go duration such as `20m` for a module whose test binaries run longer than the go command's default of 10 minutes each.
 
 `ci.yaml` passes it to the root module's job, each nested module's and each Windows or macOS leg. The synced `ci.yml` passes the repository's `GO_TEST_TIMEOUT` variable, so setting that variable raises the timeout and deleting it restores the default. Keep it below the job's 30-minute limit, so a hung test still fails with its stack traces.
 
 `noui` is the one build tag for an app built without its web UI, which leaves the API alone. When the tag changes which files of the module build, `go-ci.yaml` runs `go vet`, golangci-lint and `go test` again with `-tags noui`. A module the tag does not change skips that step, and the step needs no input or repository variable.
 
 The step compares the files `go list` leaves out with and without the tag, so a constraint on any Go, C or assembly source file counts. That covers `//go:build noui`, `!noui`, an expression holding the tag and an old `// +build` line. The step runs without `-race`, because a second race run can put a large module past the job's 30-minute limit. So files only the `noui` build compiles are in no race run.
+
+A test behind a build tag, such as `//go:build integration`, runs in CI only when its module asks for it, because such a test can need what a runner lacks, such as a live server or a Docker daemon. A module asks with a `.go-test-tags` file beside its `go.mod`: one line of comma-separated build tags, such as `integration`. `go-ci.yaml` then sets up Node.js at `ts-ci.yaml`'s major and runs `go vet`, golangci-lint and `go test` again with those tags, without `-race` for the reason above. A test that drives `npm` installs its packages from a lockfile in the module, so its tools, `tsc` among them, are pinned there. The step fails when the file holds anything else, names `noui`, or names tags that change no file of the module, since it would then test nothing. A module with no file skips the step. Name only tags whose tests run on a GitHub runner with Go and Node.js and no other service.
 
 With `web-lint: true`, a package that declares a `lint:web` script in `package.json` runs that script in place of Stylelint and html-validate, so a local `npm run lint:web` is the same check. The script must lint every tracked CSS file with Stylelint and the synced `.stylelintrc.json`, lint every tracked HTML file with html-validate, and exit non-zero when either fails.
 

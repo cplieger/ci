@@ -155,6 +155,58 @@ jobs:
               && go test -count=1 -tags noui ${GO_TEST_TIMEOUT:+"-timeout=$GO_TEST_TIMEOUT"} ./...
           ) || { echo "noui" >> /tmp/_ci_failures; exit 1; }
 
+      # A tagged test can need what CI lacks (a live service), so no tag runs
+      # unasked: a module opts in with a .go-test-tags file beside its go.mod,
+      # one line of comma-separated build tags. Node is set up for tests that
+      # drive node or npm; each module locks its own npm tools.
+      - name: Setup Node.js for tagged tests
+        if: ${{ hashFiles(format('{0}/.go-test-tags', inputs.working-directory)) != '' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # The tests install their own packages, so setup-node caches nothing.
+          package-manager-cache: false
+          # Keep in step with ts-ci.yaml's validate Setup Node.js.
+          node-version: '26'
+
+      # Vet, lint and the tests again under the module's .go-test-tags, without
+      # -race for the reason Test (noui) gives. Tags that change no file fail,
+      # since the step would then test nothing while reading as covered. The
+      # file is never echoed: a `::` line in it would run as a workflow command.
+      # errexit is off left of the `||`. scripts/test_go_test_tags.py runs this body.
+      - name: Test (tags)
+        id: test-tags
+        continue-on-error: true
+        env:
+          GO_TEST_TIMEOUT: ${{ inputs.go-test-timeout }}
+        run: |
+          (
+            if [ ! -f .go-test-tags ]; then
+              echo "tags: no .go-test-tags beside go.mod; skipping"
+              exit 0
+            fi
+            tags=$(grep -v '^[[:space:]]*$' .go-test-tags | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//') || true
+            if ! printf '%s\n' "$tags" | grep -Eqx '[A-Za-z0-9_.]+(,[A-Za-z0-9_.]+)*' || [ "$(printf '%s\n' "$tags" | wc -l)" -ne 1 ]; then
+              echo "::error file=.go-test-tags::.go-test-tags must hold one line of comma-separated Go build tags (letters, digits, '_' and '.'), such as integration"
+              exit 1
+            fi
+            if printf '%s\n' "$tags" | tr ',' '\n' | grep -qx noui; then
+              echo "::error file=.go-test-tags::remove noui from .go-test-tags: the Test (noui) step runs the noui build"
+              exit 1
+            fi
+            files='{{.ImportPath}}:{{range .IgnoredGoFiles}} {{.}}{{end}}{{range .IgnoredOtherFiles}} {{.}}{{end}}'
+            plain=$(go list -e -f "$files" ./...) && tagged=$(go list -e -tags "$tags" -f "$files" ./...) \
+              || { echo "::error::tags: go list could not list this module's packages"; exit 1; }
+            if [ "$plain" = "$tagged" ]; then
+              echo "::error file=.go-test-tags::the tags in .go-test-tags change no file of this module, so this step would test nothing. Name the tags its tests' //go:build lines use, or delete the file"
+              exit 1
+            fi
+            echo "tags: $tags changes the files these packages leave out (< without it, > with it):"
+            diff <(printf '%s\n' "$plain") <(printf '%s\n' "$tagged") | grep '^[<>]'
+            go vet -tags "$tags" ./... \
+              && golangci-lint run --allow-parallel-runners --timeout=5m --build-tags="$tags" ./... \
+              && go test -count=1 -tags "$tags" ${GO_TEST_TIMEOUT:+"-timeout=$GO_TEST_TIMEOUT"} ./...
+          ) || { echo "tags" >> /tmp/_ci_failures; exit 1; }
+
       - name: Govulncheck
         id: govulncheck
         continue-on-error: true
@@ -290,6 +342,7 @@ jobs:
             lint-golangci-lint ${{ steps.lint-golangci-lint.outcome }}
             test-race ${{ steps.test-race.outcome }}
             test-noui ${{ steps.test-noui.outcome }}
+            test-tags ${{ steps.test-tags.outcome }}
             govulncheck ${{ steps.govulncheck.outcome }}
             verify-modules ${{ steps.verify-modules.outcome }}
             wiregen-drift ${{ steps.wiregen-drift.outcome }}
