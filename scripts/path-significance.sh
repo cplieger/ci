@@ -104,6 +104,8 @@ EXCLUDE_PATTERNS=(
   '(^|/)(\.knip\.jsonc?|knip\.(jsonc?|[jt]s)|knip\.config\.[jt]s)$'
   '(^|/)stryker\.config\.json$'
   '(^|/)\.golangci\.(yaml|yml)$'
+  # go-ci's opt-in to a module's build-tagged tests: CI input, never shipped.
+  '(^|/)\.go-test-tags$'
   '(^|/)\.gremlins\.(yaml|yml)$'
   '(^|/)ruff\.toml$'
 

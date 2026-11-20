@@ -217,6 +217,10 @@ put web/knip.json '{}'
 put web/knip.config.ts 'export default {}'
 D8=$(commit "refactor: dead-code adjudications only")
 chk "S11d deadset and knip configs ship nothing" "$(paths "$D7" "$D8")" 'false|[]|[]|[]'
+put .go-test-tags 'integration'
+put mod/.go-test-tags 'integration'
+D8g=$(commit "chore: run the integration tests in CI")
+chk "S11g a module's tagged-test opt-in ships nothing" "$(paths "$D8" "$D8g")" 'false|[]|[]|[]'
 put corpus.lock.json '{}'
 put api-surface.json '{}'
 D9=$(commit "chore: test inputs only")
