@@ -73,13 +73,16 @@ def say(msg: Template, *, file: TextIO | None = None) -> None:
     (actions/runner ActionCommand.TryParse), so every `##[` is broken, the script's own
     text included.
     """
-    line = SAY_PREFIX + render(msg, escape_line)
-    print(line.replace('##[', '#%23['), file=file)
+    _write_line(render(msg, escape_line), file)
 
 
 def say_lines(text: str, *, file: TextIO | None = None) -> None:
     for line in text.splitlines():
-        say(t'{line}', file=file)
+        _write_line(escape_line(line), file)
+
+
+def _write_line(text: str, file: TextIO | None) -> None:
+    print((SAY_PREFIX + text).replace('##[', '#%23['), file=file)
 
 
 def run_main(main: Callable[[], int | None]) -> int:
@@ -93,6 +96,5 @@ def run_main(main: Callable[[], int | None]) -> int:
         print(command('error', exc.code), file=sys.stderr)
         return 1
     except Exception:
-        for line in traceback.format_exc().splitlines():
-            say(t'{line}', file=sys.stderr)
+        say_lines(traceback.format_exc(), file=sys.stderr)
         return 1
