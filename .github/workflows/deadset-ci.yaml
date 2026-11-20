@@ -37,9 +37,9 @@ permissions:
 # this workflow over fixed repositories to prove each set before it ships.
 env:
   # renovate: datasource=go depName=github.com/cplieger/deadset/v2
-  DEADSET_VERSION: v2.0.0-dev.52
+  DEADSET_VERSION: v2.0.0-dev.53
   # renovate: datasource=go depName=github.com/cplieger/deadset-go/v2
-  DEADSET_GO_VERSION: v2.0.0-dev.59
+  DEADSET_GO_VERSION: v2.0.0-dev.60
   # renovate: datasource=npm depName=@cplieger/deadset-ts
   DEADSET_TS_VERSION: 8.0.0-dev.29
 
