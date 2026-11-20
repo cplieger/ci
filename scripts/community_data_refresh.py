@@ -24,6 +24,8 @@ import workflow_commands
 OWNER = 'cplieger'
 BRANCH = 'community-data-refresh'
 WORKFLOW = 'community-data-refresh.yaml'
+# The proposal's artifact name, which the workflow's download step names too.
+ARTIFACT = 'community-data-refresh'
 # Each row's paths are every file its refresh may propose; a proposal naming
 # any other path is refused, so a repository's run reaches only its listed
 # generated files through this job's write token.
@@ -480,7 +482,8 @@ class Run(NamedTuple):
 
 def locate(gh: ghrest.Client, repo: str) -> Run:
     """The newest completed refresh run of `repo` on its base branch, refused
-    unless it succeeded: an older proposal is never read in its place."""
+    unless it succeeded and still holds its proposal: an older proposal is
+    never read in its place."""
     branch = listed(repo)['branch']
     runs = gh.get(
         f'repos/{OWNER}/{repo}/actions/workflows/{WORKFLOW}/runs'
@@ -500,8 +503,27 @@ def locate(gh: ghrest.Client, repo: str) -> Run:
             )
         if not isinstance(r.get('id'), int) or not SHA.fullmatch(str(r.get('head_sha'))):
             raise RefusedError(f'run {r.get("html_url")} names no run id and commit')
-        return Run(r['id'], r['head_sha'], r['html_url'])
+        run = Run(r['id'], r['head_sha'], r['html_url'])
+        check_proposal_held(gh, repo, run)
+        return run
     raise RefusedError(f'{repo} has no completed {WORKFLOW} run on {branch}')
+
+
+def check_proposal_held(gh: ghrest.Client, repo: str, run: Run) -> None:
+    """Refuses unless `run` holds an unexpired ARTIFACT, which the repository's
+    own workflow keeps only for its retention-days."""
+    artifacts = gh.get(f'repos/{OWNER}/{repo}/actions/runs/{run.id}/artifacts?name={ARTIFACT}')
+    named = [a for a in artifacts['artifacts'] if a.get('name') == ARTIFACT]
+    if any(a.get('expired') is False for a in named):
+        return
+    first = f"Run {repo}'s {WORKFLOW} first, then this workflow"
+    if not named:
+        raise RefusedError(
+            f"{repo}'s newest refresh run {run.url} uploaded no {ARTIFACT} artifact. {first}"
+        )
+    raise RefusedError(
+        f"The {ARTIFACT} artifact of {repo}'s newest refresh run {run.url} has expired. {first}"
+    )
 
 
 def cmd_locate(a) -> int:

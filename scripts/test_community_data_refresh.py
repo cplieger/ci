@@ -718,9 +718,26 @@ def a_run(run_id=41, **kw):
     return {**run, **kw}
 
 
+def artifacts_of(run_id, api=API):
+    return f'{api}/actions/runs/{run_id}/artifacts?name=community-data-refresh'
+
+
+def an_artifact(**kw):
+    return {'id': 9, 'name': 'community-data-refresh', 'expired': False, **kw}
+
+
 class Locate(unittest.TestCase):
-    def locate(self, runs):
-        fake = FakeGitHub({('GET', RUNS): {'workflow_runs': runs}})
+    def locate(self, runs, artifacts=None):
+        """locate over `runs`, each run holding a live proposal unless
+        `artifacts` maps its id to another artifact list."""
+        routes = {('GET', RUNS): {'workflow_runs': runs}}
+        for r in runs:
+            listed = (artifacts or {}).get(r['id'], [an_artifact()])
+            routes['GET', artifacts_of(r['id'])] = {
+                'total_count': len(listed),
+                'artifacts': listed,
+            }
+        fake = FakeGitHub(routes)
         return cdr.locate(ghrest.Client(run=fake, sleep=lambda _: None), 'langtag'), fake.writes
 
     def test_the_newest_run_of_the_base_branch_is_read(self):
@@ -741,6 +758,37 @@ class Locate(unittest.TestCase):
             cdr.RefusedError, r'runs/7 concluded failure, so it proposes nothing'
         ):
             self.locate([a_run(7, conclusion='failure'), a_run(6)])
+
+    def test_a_run_whose_proposal_is_gone_is_refused_rather_than_an_older_one_read(self):
+        url = re.escape(a_run(7)['html_url'])
+        first = re.escape("Run langtag's community-data-refresh.yaml first, then this workflow")
+        expired = (
+            f"community-data-refresh artifact of langtag's newest refresh run {url} has expired"
+        )
+        for name, listed, want in (
+            ('no artifact', [], f'{url} uploaded no community-data-refresh artifact'),
+            (
+                'only another name',
+                [an_artifact(name='other')],
+                f'{url} uploaded no community-data-refresh artifact',
+            ),
+            ('expired', [an_artifact(expired=True)], expired),
+            ('no expiry state', [{'id': 9, 'name': 'community-data-refresh'}], expired),
+        ):
+            with (
+                self.subTest(name),
+                self.assertRaisesRegex(cdr.RefusedError, f'{want}\\. {first}\\Z'),
+            ):
+                self.locate([a_run(7), a_run(6)], {7: listed})
+
+    def test_a_run_holding_its_proposal_is_read(self):
+        run, _ = self.locate([a_run(7)], {7: [an_artifact(name='other'), an_artifact()]})
+        self.assertEqual(run, cdr.Run(7, BASE, a_run(7)['html_url']))
+
+    def test_the_artifact_checked_is_the_one_the_workflow_downloads(self):
+        steps = yaml.safe_load(WORKFLOW.read_text())['jobs']['propose']['steps']
+        (download,) = [s for s in steps if s['name'] == 'Download the proposal']
+        self.assertEqual(download['with']['name'], cdr.ARTIFACT)
 
     def test_refusals(self):
         for name, runs, want in (
@@ -1626,6 +1674,7 @@ class WorkflowRun(unittest.TestCase):
         run = a_run(41, head_repository={'full_name': 'cplieger/subflux'})
         routes = {
             f'GET {runs_path}': {'workflow_runs': runs or [run]},
+            f'GET {artifacts_of(41, SAPI)}': {'total_count': 1, 'artifacts': [an_artifact()]},
             f'GET {OPEN}&page=1': [i for i in issues if i['state'] == 'open'],
             f'GET {CLOSED}&page=1': [i for i in issues if i['state'] != 'open'],
             f'POST {SAPI}/issues': {'html_url': issue_url(20)},
@@ -1688,7 +1737,18 @@ class WorkflowRun(unittest.TestCase):
         open_issues = [an_issue(3, a), an_issue(4, notices_of([a_notice('b')])[0])]
         failed = a_run(42, conclusion='failure', head_repository={'full_name': 'cplieger/subflux'})
         older = a_run(41, head_repository={'full_name': 'cplieger/subflux'})
+        expired = self.subflux_routes(open_issues)
+        expired[f'GET {artifacts_of(41, SAPI)}'] = {
+            'total_count': 1,
+            'artifacts': [an_artifact(expired=True)],
+        }
         for name, routes, proposal, step in (
+            (
+                'an expired proposal',
+                expired,
+                self.notices_proposal([]),
+                'Find the refresh run',
+            ),
             (
                 'a failed newest run',
                 self.subflux_routes(open_issues, runs=[failed, older]),
@@ -1770,6 +1830,7 @@ class WorkflowRun(unittest.TestCase):
     def test_files_only_opens_the_pull_request_and_writes_no_issue(self):
         routes = {f'{m} {p}': v for (m, p), v in base_routes().items()}
         routes[f'GET {RUNS}'] = {'workflow_runs': [a_run(41)]}
+        routes[f'GET {artifacts_of(41)}'] = {'total_count': 1, 'artifacts': [an_artifact()]}
 
         def proposal(root):
             write_proposal(root, ['scripttable.go'], {'scripttable.go': b'new\n'})
