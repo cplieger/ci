@@ -82,7 +82,7 @@ jobs:
         run: |
           set -euo pipefail
           # renovate: datasource=pypi depName=PyYAML
-          VERSION=6.0.3
+          VERSION=6.0.4
           pip install -q "PyYAML==${VERSION}"
 
       # Regenerate the repo↔file manifest fresh on every run, then hand it
