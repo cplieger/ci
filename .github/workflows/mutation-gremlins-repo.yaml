@@ -515,7 +515,7 @@ jobs:
         run: |
           set -euo pipefail
           # renovate: datasource=pypi depName=PyYAML
-          VERSION=6.0.3
+          VERSION=6.0.4
           pip install -q "PyYAML==${VERSION}"
 
       - name: Download this repo's attempts
@@ -591,7 +591,7 @@ jobs:
         run: |
           set -euo pipefail
           # renovate: datasource=pypi depName=PyYAML
-          VERSION=6.0.3
+          VERSION=6.0.4
           pip install -q "PyYAML==${VERSION}"
 
       - name: Download this repo's attempts

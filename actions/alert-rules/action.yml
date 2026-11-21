@@ -21,7 +21,7 @@ runs:
       run: |
         set -euo pipefail
         # renovate: datasource=pypi depName=PyYAML
-        VERSION=6.0.3
+        VERSION=6.0.4
         pip install -q --break-system-packages "PyYAML==${VERSION}"
 
     - name: Check the rule files

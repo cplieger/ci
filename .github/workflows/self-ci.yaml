@@ -46,7 +46,7 @@ jobs:
         run: |
           set -euo pipefail
           # renovate: datasource=pypi depName=PyYAML
-          VERSION=6.0.3
+          VERSION=6.0.4
           pip install -q --break-system-packages "PyYAML==${VERSION}"
 
       # The gremlins probes time `go test` on a scratch module; ubuntu-26.04
@@ -119,7 +119,7 @@ jobs:
         run: |
           set -euo pipefail
           # renovate: datasource=pypi depName=PyYAML
-          VERSION=6.0.3
+          VERSION=6.0.4
           pip install -q --break-system-packages "PyYAML==${VERSION}"
 
       - name: Probe the tracker transport
@@ -155,7 +155,7 @@ jobs:
         run: |
           set -euo pipefail
           # renovate: datasource=pypi depName=PyYAML
-          VERSION=6.0.3
+          VERSION=6.0.4
           pip install -q --break-system-packages "PyYAML==${VERSION}"
 
       - name: Probe the alert-rules check
@@ -206,7 +206,7 @@ jobs:
         run: |
           set -euo pipefail
           # renovate: datasource=pypi depName=PyYAML
-          VERSION=6.0.3
+          VERSION=6.0.4
           pip install -q --break-system-packages "PyYAML==${VERSION}"
 
       # The go.work and pinned-install tests run real go builds; ubuntu-26.04
