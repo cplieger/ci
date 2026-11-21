@@ -2,7 +2,8 @@ name: comment-audit
 description: >-
   Fail when production and test source carries more than 0.55 comment lines per
   code line, excluding documentation examples, configuration, and generated
-  artifacts.
+  artifacts, or when a comment or Go test literal in a public repository names a
+  private plan, review or design document.
 
 runs:
   using: composite
@@ -15,5 +16,18 @@ runs:
       shell: bash
       run: |
         (
-          python3 "${GITHUB_ACTION_PATH}/comment-audit.py" --github
+          python3 "${GITHUB_ACTION_PATH}/comment-audit.py" --check ratio --github
         ) || { echo "Comment ratio" >> /tmp/_ci_failures; exit 1; }
+    # Runs whatever the ratio step answered, so one run reports both failures.
+    - name: Refuse private pointers in comments
+      if: ${{ success() || failure() }}
+      shell: bash
+      # An event whose payload has no repository object leaves REPOSITORY_PRIVATE
+      # empty, and the script asks the REST API with GH_TOKEN instead.
+      env:
+        REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        (
+          python3 "${GITHUB_ACTION_PATH}/comment-audit.py" --check pointers --github
+        ) || { echo "Private pointers" >> /tmp/_ci_failures; exit 1; }

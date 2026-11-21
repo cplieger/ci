@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Fail when source carries more than 0.55 comment lines per code line."""
+"""Fail when source carries more than 0.55 comment lines per code line (--check ratio),
+or when a comment in a public repository points at a private plan, review or design
+document a reader cannot open (--check pointers)."""
 
 from __future__ import annotations
 
@@ -93,6 +95,58 @@ SYNCED_PATHS = {
     'scripts/repin-sha.sh',
     'scripts/collect-licenses.sh',
 }
+# Comments are scanned in YAML too, though YAML carries no ratio budget.
+POINTER_ONLY_SUFFIXES = {'.yaml', '.yml'}
+# Reasons a file escapes the pointer check: the rest of exclusion()'s reasons are
+# public text all the same.
+POINTER_EXEMPT = {'generated/vendor', 'synced from cplieger/ci'}
+# A plan id: an optional one- or two-letter prefix, up to four capitals ending in an
+# unpadded digit, a hyphen and a number; POINTER_TRUE in scripts/test-comment-audit.py
+# lists examples. SHA3-256 is FIPS 202's name; zero-padded pairs are episode ranges.
+PLAN_ID = r'(?:[A-Z]{1,2}-)?(?!SHA3-)[A-Z]{1,4}[1-9][0-9]?-[0-9]{1,3}[a-z]?'
+DESIGN_DOC = r"(?:'s)?(?:\s+doc(?:ument)?)?"
+POINTER_RULES: dict[str, re.Pattern[str]] = {
+    'plan id': re.compile(rf'(?<![\w.\-/\\"\'`]){PLAN_ID}(?![\w\-])'),
+    # Two capitals, a hyphen and two capitals, or three or more letter segments, then a
+    # number. TEST-NET-1, ML-DSA-44 and HMAC-SHA-1 have one letter segment after the
+    # first, or a longer one.
+    'finding id': re.compile(
+        r'(?<![\w\-])(?:[A-Z]{2}-[A-Z]{2}|[A-Z]{2,5}(?:-[A-Z]{2,4}){2,})-[0-9]{1,3}[a-z]?(?![\w\-])'
+    ),
+    # Only where a finding would follow: a colon, a parenthesis or a number. One capital,
+    # a hyphen and two more is as often an acronym in prose as an id.
+    'letter id': re.compile(r'(?<![\w\-])[A-Z]-[A-Z]{2}(?=[:()]|\s+[(0-9])'),
+    'document id': re.compile(
+        r'\b(?:BRIEF|PLAN|DESIGN|DIGEST|REPORT|FINDING|GATE|TASK)-[0-9]+\b|\bADR-[0-9]{3,4}\b'
+    ),
+    'requirement id': re.compile(r"\bN?FR[0-9]{1,3}\b|\(AC[0-9]{1,3}\)|\bAC[0-9]{1,3}'s\b"),
+    # A singular decision number only before 's, punctuation or the line's end: a title
+    # ("Decision 3012") or a count ("for decision 5 too") runs on into words or quotes.
+    'decision': re.compile(
+        r'\bDECISIONS\s+[0-9]+\b|\b[Dd]ecisions?\s*§\s*[0-9]'
+        r"|\b[Dd]ecision\s+[0-9]+(?:\.[0-9]+)*(?='s\b|[),;:]|\.(?![0-9])|\s*$)"
+    ),
+    # A bare number only after lowercase design or DESIGN, and with no unit letter: a
+    # capitalised Design before one is a product name (Material Design 3), and the
+    # design's 2s is a duration.
+    'design section': re.compile(
+        rf'(?<!Material )\b(?:[Dd]esign|DESIGN){DESIGN_DOC}'
+        r'(?:(?:\s+section\s+|\s*§\s*)[0-9]+(?:\.[0-9]+)*[a-z]?\b|\s+[0-9]+(?:\.[0-9]+)+[a-z]?\b)'
+        rf'|\b(?:design|DESIGN){DESIGN_DOC}\s+[0-9]+\b'
+        r"|\b(?:DESIGN|REPORT|PLAN|research)(?:'s)?\s+(?:section\s+|§\s*)[0-9]"
+    ),
+    'private file': re.compile(
+        r'\b(?:REPORT|PLAN|DESIGN|DECISIONS|FOLLOWUPS|FINDINGS|BRIEF|DIGEST|VERDICT)\.(?:md|jsonl?)\b'
+        r'|\b(?:[\w-]+-)?research\.md\b|\bgate\.json\b|\bFOLLOWUPS\b'
+    ),
+    'review round': re.compile(
+        r"(?i)\b(?:review|gate|audit)\s+(?:round|cycle|r)\s*[0-9]+\b|\bround\s+[0-9]+'s\b|\breview seat\b"
+    ),
+    'run id': re.compile(r'\bwf_[0-9a-f]{16}\b'),
+    'scratch path': re.compile(r'(?:^|[\s(`"\'/])_scratch/|\.agents/tasks\b'),
+}
+# A Go test string literal holding only a plan id is test data naming the plan.
+PLAN_ID_LITERAL = re.compile(rf'(?<![\w\\])(["`])({PLAN_ID})\1')
 HEREDOC_RE = re.compile(
     r"""(?<!<)<<-?\s*(?:
         \\(?P<escaped>[A-Za-z_][A-Za-z0-9_]*)
@@ -109,6 +163,18 @@ class FileCount:
     path: str
     comments: int
     code: int
+    # (line, comment text), trailing comments and Python docstrings included.
+    notes: tuple[tuple[int, str], ...] = ()
+    # (line, value) of each Go test string literal shaped as a plan id.
+    literals: tuple[tuple[int, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class Pointer:
+    path: str
+    line: int
+    rule: str
+    token: str
 
 
 @dataclass(frozen=True)
@@ -147,6 +213,43 @@ def repository_name(root: Path) -> str:
         if match:
             return match.group(1)
     return ''
+
+
+def repository_private(root: Path) -> bool:
+    """The event payload's repository.private, else the REST API's answer with the job's
+    token. Raises RuntimeError when neither answers: an unknown visibility is never
+    read as public."""
+    flag = os.environ.get('REPOSITORY_PRIVATE', '').strip()
+    if flag in {'true', 'false'}:
+        return flag == 'true'
+    event = os.environ.get('GITHUB_EVENT_NAME', '').strip() or 'unnamed'
+    repository = repository_name(root)
+    if not repository:
+        raise RuntimeError(
+            f'the {event} event payload carries no repository.private and no repository '
+            'name was found, so the repository is not treated as public'
+        )
+    try:
+        result = subprocess.run(
+            ['gh', 'api', f'repos/{repository}', '--jq', '.private'],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        answer = 'nothing because gh is not installed'
+    else:
+        if result.returncode == 0 and result.stdout.strip() in {'true', 'false'}:
+            return result.stdout.strip() == 'true'
+        answer = (
+            f'exit {result.returncode}: {(result.stderr or result.stdout).strip() or "no output"}'
+        )
+    raise RuntimeError(
+        f'the {event} event payload carries no repository.private, and gh api '
+        f'repos/{repository} --jq .private answered {answer}, so the repository is not '
+        'treated as public'
+    )
 
 
 def visible_files(root: Path) -> list[Path]:
@@ -263,18 +366,21 @@ def heredoc_delimiters(text: str) -> list[str]:
     return delimiters
 
 
-def unquoted_backtick_count(text: str) -> int:
+def unquoted_backtick_count(text: str, *, raw: bool) -> int:
+    """Backticks outside a ' or " quote on this line. Inside a backtick string a quote is
+    literal, and a backslash escapes only where raw is false (a JS template literal)."""
     count = 0
     quote = ''
     index = 0
     while index < len(text):
         char = text[index]
         if quote:
-            if char == '\\':
+            if char == '\\' and not (quote == '`' and raw):
                 index += 2
                 continue
             if char == quote:
                 quote = ''
+                count += char == '`'
             index += 1
             continue
         if text.startswith('//', index):
@@ -285,20 +391,69 @@ def unquoted_backtick_count(text: str) -> int:
                 break
             index = closing + 2
             continue
-        if char in '\'"':
+        if char in '\'"`':
             quote = char
-        elif char == '`':
-            count += 1
+            count += char == '`'
         elif char == '\\':
             index += 1
         index += 1
     return count
 
 
+def slash_comment_start(text: str) -> int:
+    """Index of the first // or /* outside a quote on this line, or -1."""
+    quote = ''
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == '\\' and quote != '`':
+                index += 2
+                continue
+            if char == quote:
+                quote = ''
+            index += 1
+            continue
+        if text.startswith(('//', '/*'), index):
+            return index
+        if char in '\'"`':
+            quote = char
+        index += 1
+    return -1
+
+
+def hash_comment_start(text: str) -> int:
+    """Index of the first # that opens a comment outside a quote on this line, or -1."""
+    quote = ''
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == '\\' and quote == '"':
+                index += 2
+                continue
+            if char == quote:
+                quote = ''
+            index += 1
+            continue
+        if char in '\'"':
+            quote = char
+        elif char == '\\':
+            index += 2
+            continue
+        elif char == '#' and (index == 0 or text[index - 1].isspace()):
+            return index
+        index += 1
+    return -1
+
+
 def scan_python(path: Path, text: str) -> FileCount:
     comments: set[int] = set()
     code: set[int] = set()
+    notes: list[tuple[int, str]] = []
     lines = text.splitlines()
+    statement_start = {tokenize.ENCODING, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT}
+    previous = tokenize.ENCODING
     ignored = {
         tokenize.ENCODING,
         tokenize.NL,
@@ -312,7 +467,14 @@ def scan_python(path: Path, text: str) -> FileCount:
         for token in tokens:
             if token.type == tokenize.COMMENT:
                 comments.add(token.start[0])
+                notes.append((token.start[0], token.string[1:]))
                 continue
+            if token.type == tokenize.STRING and previous in statement_start:
+                body = token.string.lstrip('rRbBuU').strip('\'"')
+                for offset, part in enumerate(body.split('\n')):
+                    notes.append((token.start[0] + offset, part))
+            if token.type != tokenize.NL:
+                previous = token.type
             if token.type in ignored:
                 continue
             for line in range(token.start[0], token.end[0] + 1):
@@ -320,14 +482,16 @@ def scan_python(path: Path, text: str) -> FileCount:
                     code.add(line)
     except (IndentationError, SyntaxError, tokenize.TokenError) as exc:
         raise RuntimeError(f'cannot tokenize {path}: {exc}') from exc
+    directives = set()
     if lines and lines[0].startswith('#!'):
-        code.add(1)
-        comments.discard(1)
+        directives.add(1)
     for line in (1, 2):
         if line <= len(lines) and re.search(r'coding[:=]\s*[-\w.]+', lines[line - 1]):
-            code.add(line)
-            comments.discard(line)
-    return FileCount(str(path), len(comments - code), len(code))
+            directives.add(line)
+    code |= directives
+    comments -= directives
+    kept = tuple(note for note in notes if note[0] not in directives)
+    return FileCount(str(path), len(comments - code), len(code), kept)
 
 
 def scan(path: Path, text: str, kind: str) -> FileCount:
@@ -336,12 +500,16 @@ def scan(path: Path, text: str, kind: str) -> FileCount:
     in_block = False
     multiline_quote = ''
     heredocs: list[str] = []
+    notes: list[tuple[int, str]] = []
+    literals: list[tuple[int, str]] = []
     suffix = path.suffix.lower()
     if suffix == '.py':
         return scan_python(path, text)
     block_comments = suffix in BLOCK_COMMENT_SUFFIXES
     shell_like = kind == 'hash' and suffix != '.py'
+    go_test = suffix == '.go' and test_source(path)
     for index, raw in enumerate(text.splitlines()):
+        number = index + 1
         stripped = raw.strip()
         if heredocs:
             if stripped:
@@ -360,6 +528,7 @@ def scan(path: Path, text: str, kind: str) -> FileCount:
         if in_block:
             comments += 1
             closing = stripped.find('*/')
+            notes.append((number, stripped if closing < 0 else stripped[:closing]))
             if closing >= 0:
                 in_block = False
                 if stripped[closing + 2 :].strip():
@@ -373,18 +542,24 @@ def scan(path: Path, text: str, kind: str) -> FileCount:
                 code += 1
             elif stripped.startswith('#'):
                 comments += 1
+                notes.append((number, stripped[1:]))
                 continue
             else:
                 code += 1
+                start = hash_comment_start(raw)
+                if start >= 0:
+                    notes.append((number, raw[start + 1 :]))
             if shell_like:
                 heredocs.extend(heredoc_delimiters(raw))
             continue
         if stripped.startswith('//'):
             comments += 1
+            notes.append((number, stripped[2:]))
             continue
         if block_comments and stripped.startswith('/*'):
             comments += 1
             closing = stripped.find('*/', 2)
+            notes.append((number, stripped[2:] if closing < 0 else stripped[2:closing]))
             if closing >= 0:
                 if stripped[closing + 2 :].strip():
                     code += 1
@@ -392,9 +567,33 @@ def scan(path: Path, text: str, kind: str) -> FileCount:
                 in_block = True
             continue
         code += 1
-        if unquoted_backtick_count(raw) % 2:
+        start = slash_comment_start(raw)
+        if start >= 0:
+            notes.append((number, raw[start + 2 :].removesuffix('*/')))
+        if go_test:
+            source = raw if start < 0 else raw[:start]
+            literals.extend((number, match.group(2)) for match in PLAN_ID_LITERAL.finditer(source))
+        if unquoted_backtick_count(raw, raw=suffix == '.go') % 2:
             multiline_quote = '`'
-    return FileCount(str(path), comments, code)
+    return FileCount(str(path), comments, code, tuple(notes), tuple(literals))
+
+
+def pointers(counted: FileCount, public_names: frozenset[str] = frozenset()) -> list[Pointer]:
+    """Every comment line and test literal of counted that names a private document. A
+    private file hit is skipped when public_names, the base names of the repository's
+    visible files, holds it: the comment then names a public file."""
+    found = []
+    for line, text in counted.notes:
+        for rule, pattern in POINTER_RULES.items():
+            for match in pattern.finditer(text):
+                if rule == 'private file' and match.group(0) in public_names:
+                    continue
+                found.append(Pointer(counted.path, line, rule, match.group(0)))
+                break
+    found.extend(
+        Pointer(counted.path, line, 'plan id literal', value) for line, value in counted.literals
+    )
+    return found
 
 
 def audit(root: Path) -> Audit:
@@ -421,6 +620,58 @@ def audit(root: Path) -> Audit:
             continue
         files.append(scan(relative, text, kind))
     return Audit(tuple(files), excluded)
+
+
+def pointer_kind(path: Path) -> str | None:
+    if path.suffix.lower() in POINTER_ONLY_SUFFIXES:
+        return 'hash'
+    return source_kind(path)
+
+
+def pointer_audit(root: Path) -> list[Pointer]:
+    found: list[Pointer] = []
+    visible = visible_files(root)
+    public_names = frozenset(path.name for path in visible)
+    for path in visible:
+        kind = pointer_kind(path)
+        if kind is None or path.is_symlink() or not path.exists():
+            continue
+        relative = path.relative_to(root)
+        try:
+            text = path.read_text(errors='replace')
+        except OSError as exc:
+            raise RuntimeError(f'cannot read {relative}: {exc}') from exc
+        if exclusion(relative, text) in POINTER_EXEMPT:
+            continue
+        found.extend(pointers(scan(relative, text, kind), public_names))
+    return found
+
+
+def annotation(value: str, *, prop: bool = False) -> str:
+    """Escape a GitHub workflow-command value; a property also escapes : and ,."""
+    value = value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+    return value.replace(':', '%3A').replace(',', '%2C') if prop else value
+
+
+def emit_pointers(found: list[Pointer], github: bool) -> int:
+    if not found:
+        print('Private pointers: PASS — no comment names a private plan, review or design document')
+        return 0
+    print(
+        f'Private pointers: FAIL — {len(found)} line(s) name a document a public reader cannot '
+        'open; state the rule in plain words and drop the reference'
+    )
+    for item in found:
+        print(
+            f'  {json.dumps(item.path, ensure_ascii=True)}:{item.line}: {item.rule} {item.token!r}'
+        )
+        if github:
+            print(
+                f'::error file={annotation(item.path, prop=True)},line={item.line},'
+                f'title=Private pointer::{annotation(item.rule)} {annotation(item.token)}: state '
+                'the rule in plain words and drop the reference'
+            )
+    return 1
 
 
 def emit(result: Audit, github: bool) -> int:
@@ -462,9 +713,27 @@ def emit(result: Audit, github: bool) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('path', nargs='?', default='.')
+    parser.add_argument('--check', choices=('ratio', 'pointers'), required=True)
     parser.add_argument('--github', action='store_true')
     args = parser.parse_args(argv)
     root = Path(args.path).resolve()
+    if args.check == 'pointers':
+        try:
+            private = repository_private(root)
+        except RuntimeError as exc:
+            print(f'Private pointers: FAIL — {exc}')
+            if args.github:
+                print(f'::error title=Private pointers::{annotation(str(exc))}')
+            return 2
+        if private:
+            print('Private pointers: SKIP — a private repository has no outside reader')
+            return 0
+        try:
+            found = pointer_audit(root)
+        except RuntimeError as exc:
+            print(f'comment audit: {exc}', file=sys.stderr)
+            return 2
+        return emit_pointers(found, args.github)
     repository = repository_name(root)
     if repository in EXCLUDED_REPOSITORIES:
         message = f'{repository} is excluded because it is not an app repository'
