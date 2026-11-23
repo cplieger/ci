@@ -597,7 +597,7 @@ jobs:
 
       - name: Generate the candidate's SBOM
         continue-on-error: true
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
         with:
           image: docker:rebuild-gate.invalid/candidate:latest
           format: spdx-json
@@ -632,7 +632,7 @@ jobs:
       - name: Scan the compared release's image
         if: ${{ steps.prev.outputs.ref != '' }}
         continue-on-error: true
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
         with:
           image: registry:${{ steps.prev.outputs.ref }}
           format: spdx-json
@@ -1065,7 +1065,7 @@ jobs:
       # which every reader of the SBOM uses, stays whole without them.
       - name: Generate SBOM (from image)
         if: ${{ env.PROMOTED_DIGEST == '' }}
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
         env:
           SYFT_RELATIONSHIPS_PACKAGE_FILE_OWNERSHIP: "false"
         with:
@@ -1438,7 +1438,7 @@ jobs:
 
       - name: Generate SBOM (from image)
         if: ${{ steps.claim.outputs.claimed == 'true' && steps.manifest.outputs.built == 'true' }}
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
           format: spdx-json
