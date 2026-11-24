@@ -176,7 +176,7 @@ jobs:
       contents: read
     env:
       # renovate: datasource=github-releases depName=sigstore/cosign
-      COSIGN_VERSION: v3.1.4
+      COSIGN_VERSION: v3.1.5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
